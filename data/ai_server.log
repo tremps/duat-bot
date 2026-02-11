@@ -205,3 +205,9 @@ INFO:     127.0.0.1:58108 - "POST /stop HTTP/1.1" 200 OK
 INFO:     Shutting down
 INFO:     127.0.0.1:58110 - "GET /stats HTTP/1.1" 200 OK
 INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [33149]
+
+Shutting down...
+Saving AI to /Users/stephentrempel/dev/duat-bot/data/ai_state.pkl...
+AI saved: 876,820 states, 1,770,500 games
