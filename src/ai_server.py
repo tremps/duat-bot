@@ -11,7 +11,6 @@ import signal
 import threading
 import time
 from collections import deque
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -165,10 +164,11 @@ class WinRateResponse(BaseModel):
     draws: int
 
 
-# --- Lifespan ---
+app = FastAPI(title="Duat AI Server")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+
+@app.on_event("startup")
+async def startup():
     global ai, _train_thread, _last_saved_at
 
     print("Loading AI...")
@@ -180,8 +180,9 @@ async def lifespan(app: FastAPI):
     _train_thread.start()
     print("Training thread started")
 
-    yield
 
+@app.on_event("shutdown")
+async def shutdown():
     print("\nShutting down...")
     _stop_event.set()
     _train_thread.join(timeout=10.0)
@@ -189,9 +190,6 @@ async def lifespan(app: FastAPI):
     print(f"Saving AI to {AI_FILE}...")
     _save_ai()
     print(f"AI saved: {len(ai.states):,} states, {ai.games_trained:,} games")
-
-
-app = FastAPI(title="Duat AI Server", lifespan=lifespan)
 
 
 # --- Endpoints ---
