@@ -42,6 +42,12 @@ _last_saved_at = 0
 _recent_results: deque = deque(maxlen=WIN_RATE_WINDOW)
 _games_per_sec: float = 0.0
 
+# Cached proven state counts (updated by training thread)
+_proven_wins: int = 0
+_proven_losses: int = 0
+_proven_counts_stale: bool = True
+PROVEN_REFRESH_INTERVAL = 100  # Refresh every N batches
+
 
 def _load_or_create_ai() -> DuatAI:
     """Load AI from file or create new one."""
@@ -82,41 +88,56 @@ def _train_batch():
     _maybe_save()
 
 
+def _refresh_proven_counts():
+    """Recount proven wins/losses. Must be called with _ai_lock held."""
+    global _proven_wins, _proven_losses, _proven_counts_stale
+    wins = 0
+    losses = 0
+    for info in ai.states.values():
+        if info.distance_to_win is not None:
+            wins += 1
+        if info.distance_to_loss is not None:
+            losses += 1
+    _proven_wins = wins
+    _proven_losses = losses
+    _proven_counts_stale = False
+
+
 def _training_loop():
     """Background thread: train continuously until stop is requested."""
+    batches_since_refresh = 0
     while not _stop_event.is_set():
         with _ai_lock:
             _train_batch()
-        # Yield to let best_move requests acquire the lock
+            batches_since_refresh += 1
+            if _proven_counts_stale or batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
+                _refresh_proven_counts()
+                batches_since_refresh = 0
+        # Yield to let best_move/stats requests proceed
         _stop_event.wait(0.001)
 
 
 def _compute_best_move(state: GameState) -> Optional[list]:
-    """Train from state, then return best move. Acquires _ai_lock."""
-    with _ai_lock:
-        start_time = time.monotonic()
-        while time.monotonic() - start_time < BEST_MOVE_TRAIN_DURATION:
-            if _stop_event.is_set():
-                break
+    """Train from state, then return best move."""
+    global _proven_counts_stale
+    start_time = time.monotonic()
+    while time.monotonic() - start_time < BEST_MOVE_TRAIN_DURATION:
+        if _stop_event.is_set():
+            break
+        with _ai_lock:
             ai.train_from_state(state, TRAIN_BATCH_SIZE)
+    _proven_counts_stale = True
+    with _ai_lock:
         _maybe_save()
         turn = ai.get_best_move(state)
         return _serialize_turn(turn)
 
 
 def _get_stats_snapshot():
-    """Collect stats under lock. Returns dict of values."""
-    with _ai_lock:
-        states = len(ai.states) if ai else 0
-        games_trained = ai.games_trained if ai else 0
-        wins = 0
-        losses = 0
-        for info in ai.states.values():
-            if info.distance_to_win is not None:
-                wins += 1
-            if info.distance_to_loss is not None:
-                losses += 1
-        return states, games_trained, wins, losses
+    """Collect stats. Simple reads are atomic in CPython; proven counts are cached."""
+    states = len(ai.states) if ai else 0
+    games_trained = ai.games_trained if ai else 0
+    return states, games_trained, _proven_wins, _proven_losses
 
 
 # --- Helpers ---
@@ -205,11 +226,8 @@ async def best_move(request: StateKeyRequest):
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats():
-    """Get AI statistics."""
-    loop = asyncio.get_event_loop()
-    states, games_trained, proven_wins, proven_losses = await loop.run_in_executor(
-        None, _get_stats_snapshot
-    )
+    """Get AI statistics. All values are cached/atomic reads — no lock needed."""
+    states, games_trained, proven_wins, proven_losses = _get_stats_snapshot()
 
     file_size = 0
     if os.path.exists(AI_FILE):
