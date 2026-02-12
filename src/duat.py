@@ -4,6 +4,7 @@ GameState always represents the position from P0's perspective (P0 to move).
 After a turn, call swap_players() to get the opponent's view.
 """
 
+from collections import OrderedDict
 from enum import IntEnum
 from typing import Optional
 
@@ -43,9 +44,17 @@ Move = tuple[int, str]
 Turn = tuple[Move, ...]
 
 
-# Module-level cache for canonical keys: raw_key -> (canonical_key, is_flipped)
-# is_flipped indicates whether the canonical form used a horizontal flip
-_canonical_cache: dict[tuple, tuple[tuple, bool]] = {}
+# Module-level LRU cache for canonical keys: raw_key -> (canonical_key, is_flipped)
+# Capped to prevent unbounded memory growth during long training runs.
+_CANONICAL_CACHE_MAX = 500_000
+_canonical_cache: OrderedDict[tuple, tuple[tuple, bool]] = OrderedDict()
+
+
+def _cache_put(key: tuple, value: tuple[tuple, bool]):
+    """Add entry to canonical cache with LRU eviction."""
+    _canonical_cache[key] = value
+    if len(_canonical_cache) > _CANONICAL_CACHE_MAX:
+        _canonical_cache.popitem(last=False)
 
 
 def clear_canonical_cache():
@@ -211,9 +220,9 @@ class GameState:
 
         # Cache all variants
         for k in normal_keys:
-            _canonical_cache[k] = (best_key, best_flipped)
+            _cache_put(k, (best_key, best_flipped))
         for k in flipped_keys:
-            _canonical_cache[k] = (best_key, not best_flipped)
+            _cache_put(k, (best_key, not best_flipped))
 
         return best_state, best_mapping, best_flipped
 
@@ -260,11 +269,11 @@ class GameState:
 
         # Cache all variants -> (canonical, is_flipped)
         for k in normal_keys:
-            _canonical_cache[k] = (best_key, best_flipped)
+            _cache_put(k, (best_key, best_flipped))
         for k in flipped_keys:
             # If canonical used flip, these (already flipped) are not flipped relative to canonical
             # If canonical didn't use flip, these (flipped) are flipped relative to canonical
-            _canonical_cache[k] = (best_key, not best_flipped)
+            _cache_put(k, (best_key, not best_flipped))
 
         return GameState.from_key(best_key)
 

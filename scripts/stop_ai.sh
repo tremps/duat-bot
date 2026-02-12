@@ -1,16 +1,11 @@
 #!/bin/bash
-# Stop the Duat AI server gracefully via API.
-# Creates a stop sentinel so the cron job won't restart it.
-# Use start_ai.sh to clear the sentinel and start again.
+# Stop the Duat AI server gracefully via API
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
 AI_SERVER_URL="${AI_SERVER_URL:-http://localhost:8000}"
-
-# Create stop sentinel so cron doesn't restart the server
-touch data/ai_server.stop
 
 echo "Sending stop request to AI server..."
 RESPONSE=$(curl -s -X POST "$AI_SERVER_URL/stop" 2>&1)

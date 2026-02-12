@@ -19,9 +19,6 @@ if [ -f data/ai_server.pid ]; then
     fi
 fi
 
-# Remove stop sentinel if present from a previous stop
-rm -f data/ai_server.stop
-
 echo "Starting AI server..."
 nohup python3 src/ai_server.py < /dev/null >> data/ai_server.log 2>&1 &
 PID=$!
