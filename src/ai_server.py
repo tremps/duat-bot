@@ -1,16 +1,19 @@
 """FastAPI REST server for Duat AI.
 
-All CPU-bound work (training, move computation) runs in a background thread.
-A threading.Lock ensures the AI is only accessed by one thread at a time.
-The asyncio event loop stays free to handle HTTP requests.
+A single worker thread handles all AI access (training + move computation).
+Commands are sent via a queue; the event loop stays free for HTTP requests.
+No locks needed since only the worker thread touches the AI.
 """
 
 import asyncio
 import os
+import queue
 import signal
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -32,21 +35,20 @@ TRAIN_BATCH_SIZE = 10
 AUTO_SAVE_INTERVAL = 1000
 BEST_MOVE_TRAIN_DURATION = 5.0
 WIN_RATE_WINDOW = 1000
+PROVEN_REFRESH_INTERVAL = 100  # Refresh proven counts every N batches
 
 # Global state
 ai: Optional[DuatAI] = None
-_ai_lock = threading.Lock()
 _stop_event = threading.Event()
-_train_thread: Optional[threading.Thread] = None
+_work_queue: queue.Queue = queue.Queue()
+_worker_thread: Optional[threading.Thread] = None
 _last_saved_at = 0
 _recent_results: deque = deque(maxlen=WIN_RATE_WINDOW)
 _games_per_sec: float = 0.0
 
-# Cached proven state counts (updated by training thread)
+# Cached proven state counts (updated by worker thread)
 _proven_wins: int = 0
 _proven_losses: int = 0
-_proven_counts_stale: bool = True
-PROVEN_REFRESH_INTERVAL = 100  # Refresh every N batches
 
 
 def _load_or_create_ai() -> DuatAI:
@@ -55,12 +57,12 @@ def _load_or_create_ai() -> DuatAI:
         try:
             return load_ai(AI_FILE)
         except Exception as e:
-            print(f"Warning: Could not load AI from {AI_FILE}: {e}")
+            print(f"Warning: Could not load AI (or backup): {e}")
     return DuatAI()
 
 
 def _save_ai():
-    """Save AI to file. Must be called with _ai_lock held."""
+    """Save AI to file. Only called from worker thread."""
     global _last_saved_at
     if ai:
         DATA_DIR.mkdir(exist_ok=True)
@@ -69,13 +71,13 @@ def _save_ai():
 
 
 def _maybe_save():
-    """Save if enough games since last save. Must be called with _ai_lock held."""
+    """Save if enough games since last save."""
     if ai and ai.games_trained - _last_saved_at >= AUTO_SAVE_INTERVAL:
         _save_ai()
 
 
 def _train_batch():
-    """Train a batch of games. Must be called with _ai_lock held."""
+    """Train a batch of games from the starting position."""
     global _games_per_sec
     start_state = GameState.initial()
     start_time = time.monotonic()
@@ -89,8 +91,8 @@ def _train_batch():
 
 
 def _refresh_proven_counts():
-    """Recount proven wins/losses. Must be called with _ai_lock held."""
-    global _proven_wins, _proven_losses, _proven_counts_stale
+    """Recount proven wins/losses."""
+    global _proven_wins, _proven_losses
     wins = 0
     losses = 0
     for info in ai.states.values():
@@ -100,44 +102,50 @@ def _refresh_proven_counts():
             losses += 1
     _proven_wins = wins
     _proven_losses = losses
-    _proven_counts_stale = False
 
 
-def _training_loop():
-    """Background thread: train continuously until stop is requested."""
-    batches_since_refresh = 0
-    while not _stop_event.is_set():
-        with _ai_lock:
-            _train_batch()
-            batches_since_refresh += 1
-            if _proven_counts_stale or batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
-                _refresh_proven_counts()
-                batches_since_refresh = 0
-        # Yield to let best_move/stats requests proceed
-        _stop_event.wait(0.001)
-
-
-def _compute_best_move(state: GameState) -> Optional[list]:
-    """Train from state, then return best move."""
-    global _proven_counts_stale
+def _do_best_move(state: GameState) -> Optional[list]:
+    """Train from state for BEST_MOVE_TRAIN_DURATION, then return best move."""
     start_time = time.monotonic()
     while time.monotonic() - start_time < BEST_MOVE_TRAIN_DURATION:
         if _stop_event.is_set():
             break
-        with _ai_lock:
-            ai.train_from_state(state, TRAIN_BATCH_SIZE)
-    _proven_counts_stale = True
-    with _ai_lock:
-        _maybe_save()
-        turn = ai.get_best_move(state)
-        return _serialize_turn(turn)
+        ai.train_from_state(state, TRAIN_BATCH_SIZE)
+    _maybe_save()
+    turn = ai.get_best_move(state)
+    return _serialize_turn(turn)
 
 
-def _get_stats_snapshot():
-    """Collect stats. Simple reads are atomic in CPython; proven counts are cached."""
-    states = len(ai.states) if ai else 0
-    games_trained = ai.games_trained if ai else 0
-    return states, games_trained, _proven_wins, _proven_losses
+def _worker_loop():
+    """Single worker thread: processes commands and trains when idle."""
+    batches_since_refresh = 0
+
+    while not _stop_event.is_set():
+        # Check for commands (short timeout so we keep training)
+        try:
+            cmd, future = _work_queue.get(timeout=0.005)
+        except queue.Empty:
+            # No commands — train a batch
+            _train_batch()
+            batches_since_refresh += 1
+            if batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
+                _refresh_proven_counts()
+                batches_since_refresh = 0
+            continue
+
+        # Process command
+        try:
+            if cmd == "best_move":
+                state = future._state_arg  # attached by caller
+                result = _do_best_move(state)
+                future.set_result(result)
+                _refresh_proven_counts()
+                batches_since_refresh = 0
+            elif cmd == "save":
+                _save_ai()
+                future.set_result(None)
+        except Exception as e:
+            future.set_exception(e)
 
 
 # --- Helpers ---
@@ -185,49 +193,60 @@ class WinRateResponse(BaseModel):
     draws: int
 
 
-app = FastAPI(title="Duat AI Server")
+# --- Lifespan ---
 
-
-@app.on_event("startup")
-async def startup():
-    global ai, _train_thread, _last_saved_at
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ai, _worker_thread, _last_saved_at
 
     print("Loading AI...")
     ai = _load_or_create_ai()
     _last_saved_at = ai.games_trained
     print(f"AI loaded: {len(ai.states):,} states, {ai.games_trained:,} games trained")
 
-    _train_thread = threading.Thread(target=_training_loop, daemon=True)
-    _train_thread.start()
-    print("Training thread started")
+    _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
+    _worker_thread.start()
+    print("Worker thread started — training when idle")
 
+    yield
 
-@app.on_event("shutdown")
-async def shutdown():
     print("\nShutting down...")
     _stop_event.set()
-    _train_thread.join(timeout=10.0)
+    _worker_thread.join(timeout=10.0)
 
     print(f"Saving AI to {AI_FILE}...")
     _save_ai()
     print(f"AI saved: {len(ai.states):,} states, {ai.games_trained:,} games")
 
 
+app = FastAPI(title="Duat AI Server", lifespan=lifespan)
+
+
 # --- Endpoints ---
+
+def _submit_command(cmd: str, **kwargs) -> Future:
+    """Submit a command to the worker thread, return a Future for the result."""
+    future = Future()
+    for k, v in kwargs.items():
+        setattr(future, f"_{k}_arg", v)
+    _work_queue.put((cmd, future))
+    return future
+
 
 @app.post("/best_move", response_model=BestMoveResponse)
 async def best_move(request: StateKeyRequest):
     """Get the best move for the given state."""
     state = _parse_state_key(request.state_key)
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, _compute_best_move, state)
+    future = _submit_command("best_move", state=state)
+    result = await asyncio.wrap_future(future)
     return BestMoveResponse(turn=result)
 
 
 @app.get("/stats", response_model=StatsResponse)
 async def stats():
-    """Get AI statistics. All values are cached/atomic reads — no lock needed."""
-    states, games_trained, proven_wins, proven_losses = _get_stats_snapshot()
+    """Get AI statistics. All values are cached/atomic — no blocking."""
+    states = len(ai.states) if ai else 0
+    games_trained = ai.games_trained if ai else 0
 
     file_size = 0
     if os.path.exists(AI_FILE):
@@ -248,21 +267,16 @@ async def stats():
         white_win_rate=win_rate,
         win_rate_sample_size=sample_size,
         games_per_second=_games_per_sec,
-        proven_wins=proven_wins,
-        proven_losses=proven_losses,
+        proven_wins=_proven_wins,
+        proven_losses=_proven_losses,
     )
-
-
-def _locked_save():
-    with _ai_lock:
-        _save_ai()
 
 
 @app.post("/save")
 async def save_endpoint():
     """Force save the AI state."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _locked_save)
+    future = _submit_command("save")
+    await asyncio.wrap_future(future)
     return {"status": "saved"}
 
 
@@ -291,7 +305,6 @@ async def win_rate():
 async def stop_endpoint():
     """Stop the AI server gracefully."""
     _stop_event.set()
-    # Signal uvicorn to shut down cleanly
     os.kill(os.getpid(), signal.SIGINT)
     return {"status": "stopping"}
 
