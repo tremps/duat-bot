@@ -20,8 +20,9 @@ if [ -f data/ai_server.pid ]; then
 fi
 
 echo "Starting AI server..."
-nohup python3 src/ai_server.py > data/ai_server.log 2>&1 &
+nohup python3 src/ai_server.py < /dev/null > data/ai_server.log 2>&1 &
 PID=$!
+disown $PID
 echo $PID > data/ai_server.pid
 
 # Wait briefly to check if it started successfully
