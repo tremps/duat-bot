@@ -9,38 +9,40 @@ import tempfile
 from pathlib import Path
 from typing import Union
 
-from duat import Direction
+from duat import Direction, encode_key, decode_key, encode_turn, decode_turn
 
 
-def _serialize_key(key: tuple) -> str:
-    """Convert state key (pieces tuple) to JSON-compatible string."""
-    pieces_list = [(r, c, int(d), p) for r, c, d, p in key]
+def _serialize_key(key: int) -> str:
+    """Convert int state key to JSON-compatible string."""
+    pieces = decode_key(key)
+    pieces_list = [(r, c, int(d), p) for r, c, d, p in pieces]
     return json.dumps(pieces_list)
 
 
-def _deserialize_key(s: str) -> tuple:
-    """Convert JSON string back to state key."""
+def _deserialize_key(s: str) -> int:
+    """Convert JSON string back to int state key."""
     pieces_list = json.loads(s)
     pieces = tuple((r, c, Direction(d), p) for r, c, d, p in pieces_list)
-    return pieces
+    return encode_key(pieces)
 
 
-def _serialize_turn(turn: tuple) -> str:
-    """Convert turn to JSON-compatible string."""
+def _serialize_turn(turn_int: int) -> str:
+    """Convert int-encoded turn to JSON-compatible string."""
+    turn = decode_turn(turn_int)
     return json.dumps(turn)
 
 
-def _deserialize_turn(s: str) -> tuple:
-    """Convert JSON string back to turn."""
+def _deserialize_turn(s: str) -> int:
+    """Convert JSON string back to int-encoded turn."""
     moves = json.loads(s)
-    return tuple(tuple(m) for m in moves)
+    turn = tuple(tuple(m) for m in moves)
+    return encode_turn(turn)
 
 
 def _atomic_write(filepath: Path, write_fn) -> None:
     """Write to a temp file then atomically rename over the target.
 
     This prevents corruption if the process crashes mid-write.
-    Also keeps a .bak backup of the previous file.
     """
     filepath = Path(filepath)
     filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -50,12 +52,7 @@ def _atomic_write(filepath: Path, write_fn) -> None:
     try:
         with os.fdopen(fd, "wb") as f:
             write_fn(f)
-        # Keep a backup of the previous file
-        if filepath.exists():
-            backup = filepath.with_suffix(filepath.suffix + ".bak")
-            # Replace backup atomically too
-            os.replace(filepath, backup)
-        os.rename(tmp_path, filepath)
+        os.replace(tmp_path, filepath)
     except BaseException:
         # Clean up temp file on any failure
         try:
@@ -65,12 +62,27 @@ def _atomic_write(filepath: Path, write_fn) -> None:
         raise
 
 
+def _is_old_tuple_key(key) -> bool:
+    """Check if a key is an old-format tuple (vs new int format)."""
+    return isinstance(key, tuple)
+
+
+def _migrate_old_key(key: tuple) -> int:
+    """Convert old tuple key to new int key."""
+    return encode_key(key)
+
+
+def _migrate_old_turn(turn: tuple) -> int:
+    """Convert old tuple turn to new int-encoded turn."""
+    return encode_turn(turn)
+
+
 def save_ai_pickle(ai, filepath: Union[str, Path]) -> None:
     """Save AI state using pickle (fast, compact)."""
     states_data = {}
     for key, info in ai.states.items():
         states_data[key] = {
-            "beads": info.beads,  # set of turns
+            "beads": info.beads,  # set[int]
             "distance_to_win": info.distance_to_win,
             "distance_to_loss": info.distance_to_loss,
         }
@@ -79,13 +91,14 @@ def save_ai_pickle(ai, filepath: Union[str, Path]) -> None:
         pickle.dump({
             "states": states_data,
             "games_trained": ai.games_trained,
+            "version": 2,  # int-encoded format
         }, f)
 
     _atomic_write(Path(filepath), write_fn)
 
 
 def load_ai_pickle(filepath: Union[str, Path]):
-    """Load AI state from pickle file."""
+    """Load AI state from pickle file, auto-migrating old tuple format."""
     from ai_engine import DuatAI, StateInfo
 
     with open(filepath, "rb") as f:
@@ -94,16 +107,37 @@ def load_ai_pickle(filepath: Union[str, Path]):
     ai = DuatAI()
     ai.games_trained = data["games_trained"]
 
+    version = data.get("version", 1)
+    needs_migration = version < 2
+
+    if needs_migration:
+        print("Migrating AI state from tuple format to compact int format...")
+        migrated = 0
+
     for key, info_data in data["states"].items():
         beads = info_data["beads"]
-        # Ensure beads is a set (handle old list format)
-        if not isinstance(beads, set):
-            beads = set(beads)
+
+        if needs_migration and _is_old_tuple_key(key):
+            # Migrate old tuple key to int
+            key = _migrate_old_key(key)
+            # Migrate old tuple beads to int set
+            if not isinstance(beads, set):
+                beads = set(beads)
+            beads = {_migrate_old_turn(t) for t in beads}
+            migrated += 1
+        else:
+            # New format or already int
+            if not isinstance(beads, set):
+                beads = set(beads)
+
         ai.states[key] = StateInfo(
             beads=beads,
             distance_to_win=info_data["distance_to_win"],
             distance_to_loss=info_data["distance_to_loss"],
         )
+
+    if needs_migration:
+        print(f"Migration complete: {migrated:,} states converted")
 
     return ai
 
@@ -113,7 +147,7 @@ def save_ai_json(ai, filepath: Union[str, Path]) -> None:
     serialized_states = {}
     for key, info in ai.states.items():
         key_str = _serialize_key(key)
-        serialized_beads = [_serialize_turn(turn) for turn in info.beads]
+        serialized_beads = [_serialize_turn(turn_int) for turn_int in info.beads]
         serialized_states[key_str] = {
             "beads": serialized_beads,
             "distance_to_win": info.distance_to_win,
@@ -123,6 +157,7 @@ def save_ai_json(ai, filepath: Union[str, Path]) -> None:
     data = {
         "games_trained": ai.games_trained,
         "states": serialized_states,
+        "version": 2,
     }
 
     def write_fn(f):
@@ -176,24 +211,10 @@ def save_ai(ai, filepath: Union[str, Path]) -> None:
 def load_ai(filepath: Union[str, Path]):
     """
     Load AI state (auto-detect format from extension).
-    Falls back to .bak backup if the main file is corrupt.
 
     .pkl/.pickle -> pickle format
     .json -> JSON format
     """
     filepath = Path(filepath)
-    backup = filepath.with_suffix(filepath.suffix + ".bak")
     load_fn = load_ai_pickle if filepath.suffix in (".pkl", ".pickle") else load_ai_json
-
-    # Try main file first
-    try:
-        return load_fn(filepath)
-    except Exception as e:
-        print(f"Warning: Could not load {filepath}: {e}")
-
-    # Try backup
-    if backup.exists():
-        print(f"Trying backup {backup}...")
-        return load_fn(backup)
-
-    raise FileNotFoundError(f"No valid AI state at {filepath} or {backup}")
+    return load_fn(filepath)

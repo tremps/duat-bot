@@ -1,25 +1,31 @@
 """MENACE-style matchbox AI with distance tracking for Duat."""
 
 import random
-from dataclasses import dataclass, field
 from typing import Optional
-from duat import GameState, Turn
+from duat import (
+    GameState, Turn,
+    encode_turn, decode_turn, is_three_move_turn,
+)
 
 
-@dataclass
 class StateInfo:
-    """Information about a game state."""
+    """Information about a game state. Uses __slots__ for compact memory."""
 
-    beads: set[Turn] = field(default_factory=set)  # available turns (removed when proven to lose)
-    distance_to_win: Optional[int] = None   # turns until forced win (if proven)
-    distance_to_loss: Optional[int] = None  # turns until forced loss (if proven)
+    __slots__ = ("beads", "distance_to_win", "distance_to_loss")
+
+    def __init__(self, beads: Optional[set[int]] = None,
+                 distance_to_win: Optional[int] = None,
+                 distance_to_loss: Optional[int] = None):
+        self.beads: set[int] = beads if beads is not None else set()
+        self.distance_to_win = distance_to_win
+        self.distance_to_loss = distance_to_loss
 
     def is_proven_loss(self) -> bool:
         """True if this state is a proven loss (no beads left)."""
         return len(self.beads) == 0
 
-    def available_turns(self) -> list[Turn]:
-        """Get turns that still have beads."""
+    def available_turns(self) -> list[int]:
+        """Get int-encoded turns that still have beads."""
         return list(self.beads)
 
 
@@ -28,7 +34,7 @@ class DuatAI:
     Matchbox learning AI with distance tracking.
 
     Each state stores:
-    - beads: possible turns with their counts
+    - beads: possible turns as int-encoded values
     - distance_to_win: how many turns until forced win (if proven winner)
     - distance_to_loss: how many turns until forced loss (if proven loser)
 
@@ -40,25 +46,27 @@ class DuatAI:
 
     def __init__(self):
         """Initialize the AI."""
-        self.states: dict[tuple, StateInfo] = {}
+        self.states: dict[int, StateInfo] = {}
         self.games_trained = 0
 
-    def get_or_create_state(self, canonical: GameState, key: tuple) -> StateInfo:
+    def get_or_create_state(self, canonical: GameState, key: int) -> StateInfo:
         """Get or create the StateInfo for a canonical state."""
         if key not in self.states:
             # Check for immediate win first - this is fast and avoids
             # computing all legal turns when we can just win
             winning_turn = canonical.find_winning_turn()
             if winning_turn:
-                # Immediate win - store just this one turn
+                # Immediate win - store just this one turn (encoded)
                 self.states[key] = StateInfo(
-                    beads={winning_turn},
+                    beads={encode_turn(winning_turn)},
                     distance_to_win=1
                 )
             else:
-                # No immediate win - compute all legal turns
+                # No immediate win - compute all legal turns, encode them
                 turns = canonical.get_legal_turns()
-                self.states[key] = StateInfo(beads=set(turns))
+                self.states[key] = StateInfo(
+                    beads={encode_turn(t) for t in turns}
+                )
 
         return self.states[key]
 
@@ -96,36 +104,38 @@ class DuatAI:
         canonical, orig_to_canon, is_flipped = state.canonical_with_mapping()
         key = canonical.to_key()
         info = self.get_or_create_state(canonical, key)
-        available = info.available_turns()
+        available = info.available_turns()  # list[int]
 
         canon_to_orig = self._invert_mapping(orig_to_canon)
 
         if available:
             # Check for 1-move wins first
-            for turn in available:
-                if len(turn) == 1:
+            for turn_int in available:
+                if not is_three_move_turn(turn_int):
+                    turn = decode_turn(turn_int)
                     result = canonical.apply_turn(turn)
                     if result and result.get_winner() == 0:
-                        # Immediate win - prune to just this move
-                        info.beads = {turn}
+                        info.beads = {turn_int}
                         info.distance_to_win = 1
                         return self._transform_turn(turn, canon_to_orig, is_flipped)
 
             # Check for 3-move wins
-            for turn in available:
-                if len(turn) == 3:
+            for turn_int in available:
+                if is_three_move_turn(turn_int):
+                    turn = decode_turn(turn_int)
                     result = canonical.apply_turn(turn)
                     if result and result.get_winner() == 0:
-                        # Immediate win - prune to just this move
-                        info.beads = {turn}
+                        info.beads = {turn_int}
                         info.distance_to_win = 1
                         return self._transform_turn(turn, canon_to_orig, is_flipped)
 
             # Have beads - pick move with lowest opponent distance_to_loss (quickest win for us)
+            best_turn_int = None
             best_turn = None
             best_score = float('inf')
 
-            for turn in available:
+            for turn_int in available:
+                turn = decode_turn(turn_int)
                 result = canonical.apply_turn(turn)
                 if result is None:
                     continue
@@ -136,11 +146,13 @@ class DuatAI:
                 if result_info and result_info.distance_to_loss is not None:
                     if result_info.distance_to_loss < best_score:
                         best_score = result_info.distance_to_loss
+                        best_turn_int = turn_int
                         best_turn = turn
 
             if best_turn is None:
                 # No proven path, pick random
-                best_turn = random.choice(available)
+                best_turn_int = random.choice(available)
+                best_turn = decode_turn(best_turn_int)
 
             return self._transform_turn(best_turn, canon_to_orig, is_flipped)
 
@@ -170,8 +182,8 @@ class DuatAI:
 
         return self._transform_turn(best_turn, canon_to_orig, is_flipped)
 
-    def choose_turn(self, canonical: GameState, key: tuple,
-                    orig_to_canon: dict[int, int], is_flipped: bool) -> Optional[tuple[Turn, Turn]]:
+    def choose_turn(self, canonical: GameState, key: int,
+                    orig_to_canon: dict[int, int], is_flipped: bool) -> Optional[tuple[Turn, int]]:
         """
         Choose a turn for the current state (for training).
 
@@ -179,10 +191,10 @@ class DuatAI:
         2. Otherwise, random selection from available beads.
         3. Returns None if this is a losing state (no beads).
 
-        Returns (original_space_turn, canonical_space_turn) or None.
+        Returns (original_space_turn, canonical_int_turn) or None.
         """
         info = self.get_or_create_state(canonical, key)
-        available = info.available_turns()
+        available = info.available_turns()  # list[int]
 
         if not available:
             return None
@@ -190,27 +202,28 @@ class DuatAI:
         canon_to_orig = self._invert_mapping(orig_to_canon)
 
         # Check for 1-move wins first
-        for turn in available:
-            if len(turn) == 1:
+        for turn_int in available:
+            if not is_three_move_turn(turn_int):
+                turn = decode_turn(turn_int)
                 result = canonical.apply_turn(turn)
                 if result and result.get_winner() == 0:
-                    # Immediate win - prune to just this move
-                    info.beads = {turn}
+                    info.beads = {turn_int}
                     info.distance_to_win = 1
-                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn)
+                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
 
         # Check for 3-move wins
-        for turn in available:
-            if len(turn) == 3:
+        for turn_int in available:
+            if is_three_move_turn(turn_int):
+                turn = decode_turn(turn_int)
                 result = canonical.apply_turn(turn)
                 if result and result.get_winner() == 0:
-                    # Immediate win - prune to just this move
-                    info.beads = {turn}
+                    info.beads = {turn_int}
                     info.distance_to_win = 1
-                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn)
+                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
 
         # Check for forced win in 2 turns (move to state with distance_to_loss == 1)
-        for turn in available:
+        for turn_int in available:
+            turn = decode_turn(turn_int)
             result = canonical.apply_turn(turn)
             if result is None:
                 continue
@@ -218,22 +231,22 @@ class DuatAI:
             result_key = result_swapped.canonical().to_key()
             result_info = self.states.get(result_key)
             if result_info and result_info.distance_to_loss == 1:
-                # Forced win in 2 - prune to this move
-                info.beads = {turn}
+                info.beads = {turn_int}
                 info.distance_to_win = 2
-                return (self._transform_turn(turn, canon_to_orig, is_flipped), turn)
+                return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
 
         # No winning move, pick random from available beads
-        canonical_turn = random.choice(available)
-        return (self._transform_turn(canonical_turn, canon_to_orig, is_flipped), canonical_turn)
+        canonical_turn_int = random.choice(available)
+        canonical_turn = decode_turn(canonical_turn_int)
+        return (self._transform_turn(canonical_turn, canon_to_orig, is_flipped), canonical_turn_int)
 
-    def update_loss(self, key: tuple, canonical_turn: Turn) -> Optional[tuple]:
+    def update_loss(self, key: int, canonical_turn_int: int) -> Optional[int]:
         """
         Remove a bead for a losing move.
 
         Args:
-            key: Canonical state key.
-            canonical_turn: Turn in canonical space.
+            key: Canonical state key (int).
+            canonical_turn_int: Turn in canonical space (int-encoded).
 
         Returns the canonical key if this caused the state to become a proven loss,
         or None otherwise.
@@ -242,8 +255,8 @@ class DuatAI:
         if info is None:
             return None
 
-        if canonical_turn in info.beads:
-            info.beads.discard(canonical_turn)
+        if canonical_turn_int in info.beads:
+            info.beads.discard(canonical_turn_int)
 
             # Check if state just became a proven loss
             if len(info.beads) == 0:
@@ -251,7 +264,7 @@ class DuatAI:
 
         return None
 
-    def _mark_proven_loss(self, key: tuple, previous_key: Optional[tuple] = None):
+    def _mark_proven_loss(self, key: int, previous_key: Optional[int] = None):
         """
         Mark a state as proven loss and calculate distance_to_loss.
 
@@ -284,7 +297,7 @@ class DuatAI:
         if previous_key:
             self._check_winning_state(previous_key)
 
-    def _check_winning_state(self, key: tuple):
+    def _check_winning_state(self, key: int):
         """
         Check if a state is now a proven win.
 
@@ -296,16 +309,17 @@ class DuatAI:
             return
 
         state = GameState.from_key(key)
-        available = info.available_turns()
+        available = info.available_turns()  # list[int]
 
         if not available:
             return  # This is a loss, not a win
 
         all_have_dtl = True
         min_dtl = float('inf')
-        best_turn = None
+        best_turn_int = None
 
-        for turn in available:
+        for turn_int in available:
+            turn = decode_turn(turn_int)
             result = state.apply_turn(turn)
             if result is None:
                 all_have_dtl = False
@@ -318,13 +332,13 @@ class DuatAI:
             if result_info and result_info.distance_to_loss is not None:
                 if result_info.distance_to_loss < min_dtl:
                     min_dtl = result_info.distance_to_loss
-                    best_turn = turn
+                    best_turn_int = turn_int
             else:
                 all_have_dtl = False
                 break
 
-        if all_have_dtl and best_turn is not None:
-            info.beads = {best_turn}
+        if all_have_dtl and best_turn_int is not None:
+            info.beads = {best_turn_int}
             info.distance_to_win = int(min_dtl) + 1
 
     def train_game(self, start_state: Optional[GameState] = None) -> Optional[int]:
@@ -347,9 +361,9 @@ class DuatAI:
         state = start_state if start_state else GameState.initial()
         current_player = 0  # Track who's actually playing (for external reference)
 
-        # (canonical_key, turn) for each player's last move
-        last_move: dict[int, tuple[tuple, Turn]] = {}
-        state_counts: dict[tuple, int] = {}  # track repetitions
+        # (canonical_key_int, turn_int) for each player's last move
+        last_move: dict[int, tuple[int, int]] = {}
+        state_counts: dict[int, int] = {}  # track repetitions
 
         while True:
             # Compute canonical form once per iteration
@@ -370,14 +384,14 @@ class DuatAI:
 
                 # Remove the bead that brought us here (loser's previous move)
                 if loser in last_move:
-                    prev_key, prev_turn = last_move[loser]
-                    proven_loss_key = self.update_loss(prev_key, prev_turn)
+                    prev_key, prev_turn_int = last_move[loser]
+                    proven_loss_key = self.update_loss(prev_key, prev_turn_int)
                     if proven_loss_key:
                         self._mark_proven_loss(proven_loss_key)
 
                 return actual_winner
 
-            turn, canonical_turn = result
+            turn, canonical_turn_int = result
 
             # Check if current state is a proven win (forced win in >= 2 turns)
             state_info = self.states.get(key)
@@ -387,8 +401,8 @@ class DuatAI:
                 loser = 1 - actual_winner
 
                 if loser in last_move:
-                    prev_key, prev_turn = last_move[loser]
-                    proven_loss_key = self.update_loss(prev_key, prev_turn)
+                    prev_key, prev_turn_int = last_move[loser]
+                    proven_loss_key = self.update_loss(prev_key, prev_turn_int)
                     if proven_loss_key:
                         self._mark_proven_loss(proven_loss_key)
                         if actual_winner in last_move:
@@ -397,10 +411,10 @@ class DuatAI:
 
                 return actual_winner
 
-            # Store canonical move
-            last_move[current_player] = (key, canonical_turn)
+            # Store canonical move (int key, int turn)
+            last_move[current_player] = (key, canonical_turn_int)
 
-            # Apply the turn
+            # Apply the turn (uses tuple turn for game logic)
             new_state = state.apply_turn(turn)
             if new_state is None:
                 # Invalid state (shouldn't happen)
@@ -409,10 +423,6 @@ class DuatAI:
             # Check for win BEFORE swapping (winner detection uses piece counts)
             winner = new_state.get_winner()
             if winner is not None:
-                # winner is 0 if P0 pieces are intact (P1 lost), 1 if P1 pieces intact (P0 lost)
-                # Map to actual player: after swaps, P0 in state = current_player's opponent
-                # when current_player=0: no swaps, so winner maps directly
-                # when current_player=1: one swap, so winner maps inversely
                 if current_player == 0:
                     actual_winner = winner
                 else:
@@ -421,8 +431,8 @@ class DuatAI:
 
                 # The loser's last move led to this - remove that bead
                 if loser in last_move:
-                    prev_key, prev_turn = last_move[loser]
-                    proven_loss_key = self.update_loss(prev_key, prev_turn)
+                    prev_key, prev_turn_int = last_move[loser]
+                    proven_loss_key = self.update_loss(prev_key, prev_turn_int)
                     if proven_loss_key:
                         self._mark_proven_loss(proven_loss_key)
                         # Check if the state before that is now a proven win

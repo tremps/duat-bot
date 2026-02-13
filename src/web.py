@@ -3,14 +3,13 @@
 import os
 import signal
 import sys
-from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import httpx
 from nicegui import ui, app
 
-from duat import GameState, Direction, Turn
+from duat import GameState, Direction, Turn, state_to_string, string_to_state
 
 # AI Server configuration
 AI_SERVER_URL = os.environ.get("AI_SERVER_URL", "http://localhost:8000")
@@ -29,12 +28,148 @@ TURN_DELAY = 0.75     # Delay between turns
 # Flags for graceful shutdown and AI turns
 _shutting_down = False
 _ai_turn_in_progress = False
+_auto_playing = False
+_stop_auto_play = False
+
+# Animation state
+_prev_grid: dict = {}   # {(display_row, col): (actual_player, game_direction)}
+_animate_next = False
+CELL_STEP = 124  # 120px cell + 4px (gap-1)
 
 
-class GameMode(Enum):
-    PVP = "Player vs Player"
-    PVAI = "Player vs AI"
-    AIVAI = "AI vs AI"
+def _build_grid() -> dict:
+    """Build map of current piece display positions."""
+    grid = {}
+    for piece in game.state.pieces:
+        row, col, direction, player = piece
+        display_row = game.get_display_row(row)
+        actual_player = player if game.current_player == 0 else (1 - player)
+        grid[(display_row, col)] = (actual_player, direction)
+    return grid
+
+
+def _compute_animations(new_grid: dict) -> tuple:
+    """Compute CSS animation styles by diffing prev and new grids.
+
+    Each call covers a single game move — either a forward (slide + push)
+    or a rotation, never both. Returns (animations_dict, ghosts_list).
+    Ghosts are eliminated pieces that should slide off the board edge.
+    """
+    empty = ({}, [])
+    if not _prev_grid:
+        return empty
+
+    # Positions where the occupant changed (different player, or appeared/vanished)
+    changed = set()
+    for pos in set(_prev_grid) | set(new_grid):
+        if _prev_grid.get(pos) != new_grid.get(pos):
+            changed.add(pos)
+
+    if not changed:
+        return empty
+
+    # Find the slide direction: look for any position that lost a piece
+    # paired with any position that gained a same-player piece.
+    norm_dr = norm_dc = 0
+    for pos in changed:
+        old = _prev_grid.get(pos)
+        if old and (pos not in new_grid or new_grid[pos][0] != old[0]):
+            lost_player = old[0]
+            for pos2 in changed:
+                new2 = new_grid.get(pos2)
+                if new2 and new2[0] == lost_player:
+                    old2 = _prev_grid.get(pos2)
+                    if old2 is None or old2[0] != lost_player:
+                        dr = pos2[0] - pos[0]
+                        dc = pos2[1] - pos[1]
+                        mag = max(abs(dr), abs(dc))
+                        if mag > 0:
+                            norm_dr = dr // mag
+                            norm_dc = dc // mag
+                            break
+        if norm_dr or norm_dc:
+            break
+
+    if norm_dr or norm_dc:
+        # Forward move — find the full extent of the push chain
+        source = min(changed, key=lambda p: p[0] * norm_dr + p[1] * norm_dc)
+        end = max(changed, key=lambda p: p[0] * norm_dr + p[1] * norm_dc)
+        chain_len = (end[0] - source[0]) * norm_dr + (end[1] - source[1]) * norm_dc
+
+        dx = -norm_dc * CELL_STEP
+        dy = -norm_dr * CELL_STEP
+        slide = f'animation: piece-slide 0.3s ease-out; --slide-x: {dx}px; --slide-y: {dy}px'
+
+        # Walk the full chain, animating every piece
+        animations = {}
+        r, c = source[0] + norm_dr, source[1] + norm_dc
+        for _ in range(chain_len):
+            if (r, c) in new_grid:
+                animations[(r, c)] = slide
+            r += norm_dr
+            c += norm_dc
+
+        # Check for elimination: if one step past the chain end is off-board,
+        # the piece that was at 'end' in prev_grid was pushed off
+        ghosts = []
+        off_r, off_c = end[0] + norm_dr, end[1] + norm_dc
+        if not (0 <= off_r <= 3 and 0 <= off_c <= 3):
+            ghost_piece = _prev_grid.get(end)
+            if ghost_piece:
+                gdx = norm_dc * CELL_STEP
+                gdy = norm_dr * CELL_STEP
+                ghost_style = (
+                    f'animation: piece-slide-off 0.3s ease-out forwards;'
+                    f' --off-x: {gdx}px; --off-y: {gdy}px'
+                )
+                ghosts.append((end[0], end[1], ghost_piece[0], ghost_piece[1], ghost_style))
+
+        return animations, ghosts
+
+    # No slide detected — must be a rotation
+    animations = {}
+    for pos in changed:
+        old = _prev_grid.get(pos)
+        new = new_grid.get(pos)
+        if old and new and old[0] == new[0] and old[1] != new[1]:
+            if new[1] == old[1].rotate_cw():
+                animations[pos] = 'animation: piece-spin-ccw 0.3s ease-out'
+            elif new[1] == old[1].rotate_ccw():
+                animations[pos] = 'animation: piece-spin-cw 0.3s ease-out'
+    return animations, []
+
+
+# Inline action button positions (CSS absolute positioning inside piece)
+_BUTTON_POS = {
+    'top': 'top: 10px; left: 50%; transform: translateX(-50%)',
+    'right': 'top: 50%; right: 10px; transform: translateY(-50%)',
+    'bottom': 'bottom: 10px; left: 50%; transform: translateX(-50%)',
+    'left': 'top: 50%; left: 10px; transform: translateY(-50%)',
+}
+
+# For each game Direction: (position, symbol, game_action)
+# Display is vertically flipped so CW/CCW swap.
+# Rotation buttons only (forward is the center arrow).
+# Positions follow the "destination" rule: button is on the side
+# the piece will face after rotating that way.
+_PIECE_ACTIONS = {
+    Direction.NORTH: [  # display ↓
+        ('left', '\u21ba', 'CCW'),
+        ('right', '\u21bb', 'CW'),
+    ],
+    Direction.SOUTH: [  # display ↑
+        ('right', '\u21ba', 'CCW'),
+        ('left', '\u21bb', 'CW'),
+    ],
+    Direction.EAST: [  # display →
+        ('bottom', '\u21ba', 'CCW'),
+        ('top', '\u21bb', 'CW'),
+    ],
+    Direction.WEST: [  # display ←
+        ('top', '\u21ba', 'CCW'),
+        ('bottom', '\u21bb', 'CW'),
+    ],
+}
 
 
 def _serialize_state_key(state: GameState) -> list:
@@ -92,21 +227,22 @@ class DuatGame:
 
     def __init__(self):
         self.state: GameState = GameState.initial()
-        self.mode: GameMode = GameMode.PVP
-        self.human_player: int = 0  # Which player the human controls (0=White, 1=Black)
         self.selected_piece: Optional[int] = None
-        self.current_turn_moves: list = []  # Moves made so far this turn
+        self.current_turn_moves: list = []
         self.game_over: bool = False
         self.winner: Optional[int] = None
-        # Whether a game mode is active
-        self.game_active: bool = False
-        # For undo functionality - store states after each move
-        self.undo_stack: list = []  # Stack of (state, selected_piece) for undo
-        # Track whose turn it is (since GameState no longer has current_player)
+        self.undo_stack: list = []
         self.current_player: int = 0
+        self.history: list[str] = []
+        self._add_to_history()
 
-    def reset_game(self):
-        """Start a new game."""
+    def _add_to_history(self):
+        """Append current state string to history."""
+        s = state_to_string(self.state, self.current_player)
+        self.history.append(s)
+
+    def new_game(self):
+        """Reset game state. History is preserved (use clear_history to wipe it)."""
         self.state = GameState.initial()
         self.selected_piece = None
         self.current_turn_moves = []
@@ -114,18 +250,11 @@ class DuatGame:
         self.winner = None
         self.undo_stack = []
         self.current_player = 0
+        self._add_to_history()
 
-    def quit_game(self):
-        """Quit current game and return to mode selection."""
-        self.reset_game()
-        self.game_active = False
-
-    def start_game(self, mode: GameMode, human_player: int = 0):
-        """Start a new game with the given mode."""
-        self.mode = mode
-        self.human_player = human_player
-        self.reset_game()
-        self.game_active = True
+    def clear_history(self):
+        """Clear the history list."""
+        self.history = []
 
     def get_display_row(self, game_row: int) -> int:
         """Convert game row to display row (flipped so White/P0 is at bottom)."""
@@ -145,12 +274,11 @@ class DuatGame:
 
     def get_direction_arrow(self, direction: Direction) -> str:
         """Get arrow character for direction (flipped for display)."""
-        # Display is flipped, so North appears as down, South as up
         arrows = {
-            Direction.NORTH: "\u2193",  # Down arrow
-            Direction.SOUTH: "\u2191",  # Up arrow
-            Direction.EAST: "\u2192",   # Right arrow
-            Direction.WEST: "\u2190",   # Left arrow
+            Direction.NORTH: "\u2193",
+            Direction.SOUTH: "\u2191",
+            Direction.EAST: "\u2192",
+            Direction.WEST: "\u2190",
         }
         return arrows[direction]
 
@@ -158,27 +286,9 @@ class DuatGame:
         """Get display name for current player."""
         return "White" if self.current_player == 0 else "Black"
 
-    def is_human_turn(self) -> bool:
-        """Check if it's the human's turn."""
-        if self.mode == GameMode.PVP:
-            return True
-        if self.mode == GameMode.AIVAI:
-            return False
-        return self.current_player == self.human_player
-
-    def can_select_piece(self, piece_idx: int) -> bool:
-        """Check if a piece can be selected."""
-        if self.game_over or not self.is_human_turn():
-            return False
-        piece = self.state.pieces[piece_idx]
-        # In the internal state, current player's pieces are always P0
-        # So we check if the piece belongs to P0 (which is the current player)
-        return piece[3] == 0
-
-    def select_piece(self, piece_idx: int):
-        """Select a piece for moving."""
-        if self.can_select_piece(piece_idx):
-            self.selected_piece = piece_idx
+    def is_mid_turn(self) -> bool:
+        """Returns True if there are partial moves in the current turn."""
+        return len(self.current_turn_moves) > 0
 
     def can_make_move(self, action: str) -> bool:
         """Check if the selected piece can make this move."""
@@ -194,25 +304,21 @@ class DuatGame:
         if not self.can_make_move(action):
             return False
 
-        # Save state for undo
         self.undo_stack.append((self.state, self.selected_piece))
 
         move = (self.selected_piece, action)
         new_state = self.state.apply_move(move)
         if new_state is None:
-            self.undo_stack.pop()  # Remove failed undo state
+            self.undo_stack.pop()
             return False
 
         self.current_turn_moves.append(move)
         self.state = new_state
-        # Keep piece selected for easier multi-move turns
 
-        # Check for win mid-turn - auto submit if won
+        # Check for win mid-turn
         winner = self.state.get_winner()
         if winner is not None:
             self.game_over = True
-            # winner=0 means P0 in state won, winner=1 means P1 in state won
-            # Map to actual player based on current_player perspective
             if self.current_player == 0:
                 self.winner = winner
             else:
@@ -220,6 +326,7 @@ class DuatGame:
             self.selected_piece = None
             self.current_turn_moves = []
             self.undo_stack = []
+            self._add_to_history()
             return True
 
         return True
@@ -228,11 +335,8 @@ class DuatGame:
         """Undo the last move. Returns True if successful."""
         if not self.undo_stack or not self.current_turn_moves:
             return False
-
-        # Restore previous state
         self.state, self.selected_piece = self.undo_stack.pop()
         self.current_turn_moves.pop()
-
         return True
 
     def can_submit_turn(self) -> bool:
@@ -243,38 +347,19 @@ class DuatGame:
         """Submit the current turn."""
         if not self.can_submit_turn():
             return
-
-        # Swap players in state and track whose turn it is
         self.state = self.state.swap_players()
         self.current_player = 1 - self.current_player
         self.current_turn_moves = []
         self.selected_piece = None
         self.undo_stack = []
-
-    def can_end_turn(self) -> bool:
-        """Check if the current turn can be ended."""
-        return self.can_submit_turn()
-
-    def end_turn(self):
-        """End the current turn (alias for submit_turn)."""
-        self.submit_turn()
+        self._add_to_history()
 
     def get_state_for_ai(self) -> GameState:
-        """
-        Get state in format suitable for AI query.
-
-        AI always plays as P0, so we return the state as-is
-        (since current player is already represented as P0).
-        """
+        """Get state in format suitable for AI query."""
         return self.state
 
     def apply_ai_turn(self, turn: Turn) -> bool:
-        """
-        Apply an AI turn. Returns True if game continues.
-
-        The turn comes from AI which sees the state as P0,
-        so we can apply it directly.
-        """
+        """Apply an AI turn. Returns True if game continues."""
         for move in turn:
             new_state = self.state.apply_move(move)
             if new_state is None:
@@ -282,7 +367,6 @@ class DuatGame:
 
             self.state = new_state
 
-            # Check for win
             winner = self.state.get_winner()
             if winner is not None:
                 self.game_over = True
@@ -291,6 +375,7 @@ class DuatGame:
                 else:
                     self.winner = 1 - winner
                 self.selected_piece = None
+                self._add_to_history()
                 return False
 
         return True
@@ -300,7 +385,39 @@ class DuatGame:
         if not self.game_over:
             self.state = self.state.swap_players()
             self.current_player = 1 - self.current_player
+            self._add_to_history()
         self.selected_piece = None
+
+    def load_state(self, state: GameState, current_player: int):
+        """Load a state directly, clearing partial moves."""
+        self.state = state
+        self.current_player = current_player
+        self.selected_piece = None
+        self.current_turn_moves = []
+        self.undo_stack = []
+        self.game_over = False
+        self.winner = None
+        # Check if this state is already game over
+        winner = self.state.get_winner()
+        if winner is not None:
+            self.game_over = True
+            if self.current_player == 0:
+                self.winner = winner
+            else:
+                self.winner = 1 - winner
+
+    def load_state_string(self, s: str):
+        """Parse a state string and load it."""
+        state, current_player = string_to_state(s)
+        self.load_state(state, current_player)
+        self._add_to_history()
+
+    def load_history_entry(self, index: int):
+        """Load a history entry without adding a duplicate."""
+        if 0 <= index < len(self.history):
+            s = self.history[index]
+            state, current_player = string_to_state(s)
+            self.load_state(state, current_player)
 
 
 # Global game instance
@@ -309,177 +426,229 @@ game = DuatGame()
 
 @ui.refreshable
 def game_board():
-    """Render the game board."""
-    # Overlay to gray out board when not active
-    board_classes = 'grid grid-cols-4 gap-1 p-4 bg-amber-800 rounded-lg'
-    if not game.game_active:
-        board_classes += ' opacity-50 pointer-events-none'
+    """Render the game board with inline piece controls."""
+    global _prev_grid, _animate_next
+    controls_active = not game.game_over and not _ai_turn_in_progress
+    at_limit = len(game.current_turn_moves) >= 3
 
-    with ui.element('div').classes(board_classes):
-        for display_row in range(4):
-            for col in range(4):
-                piece_info = game.get_piece_at_display(display_row, col)
+    # Compute animations by diffing current vs previous grid
+    cur_grid = _build_grid()
+    if _animate_next:
+        animations, ghosts = _compute_animations(cur_grid)
+        _animate_next = False
+    else:
+        animations, ghosts = {}, []
+    _prev_grid = cur_grid
 
-                # Determine cell styling
-                is_selected = False
-                piece_idx = None
-                if piece_info:
-                    piece_idx, piece = piece_info
-                    is_selected = (piece_idx == game.selected_piece)
+    with ui.element('div').classes('relative overflow-visible'):
+        # Board layer — just the colored squares
+        with ui.element('div').classes('grid grid-cols-4 gap-1 p-4 bg-amber-800 rounded-lg'):
+            for _ in range(16):
+                ui.element('div').classes('rounded bg-amber-200').style('width: 120px; height: 120px')
 
-                cell_classes = 'w-16 h-16 rounded flex items-center justify-center text-3xl cursor-pointer '
-                if is_selected:
-                    cell_classes += 'bg-yellow-300 ring-4 ring-yellow-500'
-                else:
-                    cell_classes += 'bg-amber-200 hover:bg-amber-300'
-
-                # Create cell with click handler
-                idx = piece_idx  # Capture for closure
-
-                def make_click_handler(idx=idx):
-                    def handler():
-                        if game.game_active and idx is not None and game.can_select_piece(idx):
-                            game.select_piece(idx)
-                            refresh_all()
-                    return handler
-
-                with ui.element('div').classes(cell_classes).on('click', make_click_handler()):
+        # Piece layer — overlaid on top so pieces are always in front of the board
+        with ui.element('div').classes('grid grid-cols-4 gap-1 p-4 absolute inset-0 pointer-events-none'):
+            for display_row in range(4):
+                for col in range(4):
+                    piece_info = game.get_piece_at_display(display_row, col)
+                    piece_idx = None
                     if piece_info:
-                        _, piece = piece_info
-                        row, col_pos, direction, player = piece
+                        piece_idx, _ = piece_info
 
-                        # In the current state, P0 is always the current player
-                        # Map to display colors based on current_player
-                        actual_player = player if game.current_player == 0 else (1 - player)
+                    with ui.element('div').classes('relative overflow-visible').style('width: 120px; height: 120px'):
+                        if piece_info:
+                            _, piece = piece_info
+                            row, col_pos, direction, player = piece
 
-                        # Player 0 = White, Player 1 = Black
-                        if actual_player == 0:
-                            bg = 'bg-gray-100 border-2 border-gray-400'
-                            color = 'text-gray-800'
-                        else:
-                            bg = 'bg-gray-800'
-                            color = 'text-gray-100'
-                        arrow = game.get_direction_arrow(direction)
+                            actual_player = player if game.current_player == 0 else (1 - player)
 
-                        with ui.element('div').classes(
-                            f'w-12 h-12 rounded-full {bg} flex items-center justify-center {color} pointer-events-none'
-                        ):
-                            ui.label(arrow).classes('text-2xl font-bold pointer-events-none')
+                            if actual_player == 0:
+                                bg = 'bg-gray-100 border-2 border-gray-400'
+                                color = 'text-gray-800'
+                            else:
+                                bg = 'bg-gray-800'
+                                color = 'text-gray-100'
+                            arrow = game.get_direction_arrow(direction)
+
+                            # Animation wrapper — piece + buttons animate together
+                            anim_style = animations.get((display_row, col), '')
+                            with ui.element('div').classes('absolute inset-0 flex items-center justify-center').style(anim_style):
+
+                                # Piece circle — doubles as forward button for P0
+                                can_fwd = (player == 0 and controls_active
+                                           and not at_limit
+                                           and game.state.apply_move((piece_idx, 'F')) is not None)
+                                piece_cls = f'w-24 h-24 rounded-full {bg} flex items-center justify-center {color} pointer-events-auto'
+                                if can_fwd:
+                                    piece_cls += ' cursor-pointer group'
+
+                                    def make_fwd_handler(pidx=piece_idx):
+                                        def handler():
+                                            global _animate_next
+                                            if game.game_over or _ai_turn_in_progress:
+                                                return
+                                            game.selected_piece = pidx
+                                            game.make_move('F')
+                                            _animate_next = True
+                                            refresh_all()
+                                        return handler
+
+                                    with ui.element('div').classes(piece_cls).on('click.stop', make_fwd_handler()):
+                                        ui.label(arrow).classes('text-4xl font-bold pointer-events-none group-hover:scale-125 transition-transform duration-150')
+                                else:
+                                    with ui.element('div').classes(piece_cls):
+                                        ui.label(arrow).classes('text-4xl font-bold pointer-events-none')
+
+                                # Rotation buttons for P0 pieces
+                                if player == 0 and controls_active:
+                                    for pos_key, symbol, action in _PIECE_ACTIONS[direction]:
+                                        can_do = not at_limit
+
+                                        btn_cls = f'absolute w-9 h-9 rounded-full flex items-center justify-center {color} group pointer-events-auto '
+                                        if can_do:
+                                            btn_cls += 'cursor-pointer'
+                                        else:
+                                            btn_cls += 'opacity-[0.12] pointer-events-none'
+
+                                        def make_action_handler(pidx=piece_idx, act=action):
+                                            def handler():
+                                                global _animate_next
+                                                if game.game_over or _ai_turn_in_progress:
+                                                    return
+                                                game.selected_piece = pidx
+                                                game.make_move(act)
+                                                _animate_next = True
+                                                refresh_all()
+                                            return handler
+
+                                        with ui.element('div').classes(btn_cls).style(_BUTTON_POS[pos_key]).on('click.stop', make_action_handler()):
+                                            ui.label(symbol).classes('text-xl leading-none pointer-events-none font-bold group-hover:scale-125 transition-transform duration-150').style('transform: scaleY(-1)')
+
+        # Ghost layer — eliminated pieces that slide off the board edge
+        for ghost_row, ghost_col, ghost_player, ghost_dir, ghost_style in ghosts:
+            ghost_x = 16 + ghost_col * CELL_STEP
+            ghost_y = 16 + ghost_row * CELL_STEP
+            if ghost_player == 0:
+                ghost_bg = 'bg-gray-100 border-2 border-gray-400'
+                ghost_color = 'text-gray-800'
+            else:
+                ghost_bg = 'bg-gray-800'
+                ghost_color = 'text-gray-100'
+            ghost_arrow = game.get_direction_arrow(ghost_dir)
+            ghost_pos = f'position: absolute; left: {ghost_x}px; top: {ghost_y}px; width: 120px; height: 120px;'
+            with ui.element('div').style(ghost_pos + ghost_style).classes('flex items-center justify-center pointer-events-none'):
+                with ui.element('div').classes(f'w-24 h-24 rounded-full {ghost_bg} flex items-center justify-center {ghost_color}'):
+                    ui.label(ghost_arrow).classes('text-4xl font-bold')
 
 
 @ui.refreshable
 def game_status():
     """Show current game status."""
-    if not game.game_active:
-        ui.label('Select a game mode to start').classes('text-xl text-gray-500')
-    elif game.game_over:
+    if game.game_over:
         winner_name = "White" if game.winner == 0 else "Black"
-        ui.label(f'{winner_name} wins!').classes('text-2xl font-bold text-green-600')
+        ui.label(f'{winner_name} wins!').classes('text-lg font-bold text-green-600')
     else:
         player_name = game.get_current_player_name()
-        ui.label(f"{player_name}'s Turn").classes('text-xl font-bold')
-
-
-@ui.refreshable
-def game_controls_top():
-    """Forward button above the board."""
-    if not game.game_active or game.game_over or not game.is_human_turn():
-        # Empty placeholder to maintain layout
-        ui.element('div').classes('h-10')
-        return
-
-    has_selection = game.selected_piece is not None
-    fwd_btn = ui.button('Forward', on_click=lambda: make_move('F')).classes('bg-green-500 w-32')
-    if not has_selection or not game.can_make_move('F'):
-        fwd_btn.disable()
-
-
-@ui.refreshable
-def game_controls_left():
-    """CW button to the left of the board."""
-    if not game.game_active or game.game_over or not game.is_human_turn():
-        ui.element('div').classes('w-24')
-        return
-
-    has_selection = game.selected_piece is not None
-    # Note: Actions are swapped because display is vertically flipped
-    cw_btn = ui.button('\u21bb', on_click=lambda: make_move('CCW')).classes('bg-blue-500 w-16 h-16 text-3xl')
-    if not has_selection or not game.can_make_move('CCW'):
-        cw_btn.disable()
-
-
-@ui.refreshable
-def game_controls_right():
-    """CCW button to the right of the board."""
-    if not game.game_active or game.game_over or not game.is_human_turn():
-        ui.element('div').classes('w-24')
-        return
-
-    has_selection = game.selected_piece is not None
-    # Note: Actions are swapped because display is vertically flipped
-    ccw_btn = ui.button('\u21ba', on_click=lambda: make_move('CW')).classes('bg-blue-500 w-16 h-16 text-3xl')
-    if not has_selection or not game.can_make_move('CW'):
-        ccw_btn.disable()
+        moves = len(game.current_turn_moves)
+        if moves > 0:
+            ui.label(f"{player_name}'s Turn ({moves} move{'s' if moves != 1 else ''})").classes('text-lg font-bold')
+        else:
+            ui.label(f"{player_name}'s Turn").classes('text-lg font-bold')
 
 
 @ui.refreshable
 def game_controls_bottom():
-    """Undo/Submit buttons and status below the board."""
-    if not game.game_active:
-        return
-
-    if game.game_over:
-        ui.button('New Game', on_click=lambda: (game.reset_game(), refresh_all())).classes('bg-green-500')
-        return
-
-    if not game.is_human_turn():
-        if game.mode == GameMode.AIVAI:
-            with ui.row().classes('gap-2'):
-                ui.button('Step (AI Move)', on_click=animate_ai_turn).classes('bg-blue-500')
-                ui.button('Auto Play', on_click=auto_play).classes('bg-purple-500')
-        else:
-            ui.label('AI is thinking...').classes('text-gray-600')
-            # Only create timer if AI turn not already in progress
-            if not _ai_turn_in_progress:
-                ui.timer(TURN_DELAY, animate_ai_turn, once=True)
-        return
-
-    # Human turn controls
+    """Game control buttons."""
     move_count = len(game.current_turn_moves)
+    ai_disabled = game.is_mid_turn() or _ai_turn_in_progress or game.game_over
 
-    # Undo and Submit buttons
-    with ui.row().classes('gap-2'):
-        undo_btn = ui.button('Undo', on_click=lambda: (game.undo_move(), refresh_all())).classes('bg-yellow-500')
-        if move_count == 0:
-            undo_btn.disable()
+    with ui.card().classes('px-3 py-2 w-full'):
+        ui.label('Controls').classes('text-sm font-semibold text-gray-700 mb-1')
 
-        can_submit = game.can_submit_turn()
-        submit_text = f'Submit ({move_count} move{"s" if move_count != 1 else ""})'
-        submit_btn = ui.button(submit_text, on_click=lambda: (game.submit_turn(), refresh_all())).classes('bg-orange-500')
-        if not can_submit:
-            submit_btn.disable()
+        with ui.row().classes('gap-1 flex-wrap'):
+            undo_btn = ui.button('Undo', on_click=lambda: (game.undo_move(), refresh_all())).props('dense').classes('bg-yellow-500')
+            if move_count == 0 or _ai_turn_in_progress:
+                undo_btn.disable()
+
+            can_submit = game.can_submit_turn()
+            submit_text = f'End Turn ({move_count})'
+            submit_btn = ui.button(submit_text, on_click=lambda: (game.submit_turn(), refresh_all())).props('dense').classes('bg-orange-500')
+            if not can_submit or _ai_turn_in_progress:
+                submit_btn.disable()
+
+            ai_btn = ui.button('AI Move', on_click=do_ai_move).props('dense').classes('bg-blue-500')
+            if ai_disabled:
+                ai_btn.disable()
+
+            if _auto_playing:
+                ui.button('Stop', on_click=stop_auto_play_fn).props('dense').classes('bg-red-500')
+            else:
+                auto_btn = ui.button('Auto Play', on_click=do_auto_play).props('dense').classes('bg-purple-500')
+                if ai_disabled:
+                    auto_btn.disable()
+
+            new_btn = ui.button('New Game', on_click=lambda: (game.new_game(), refresh_all())).props('dense').classes('bg-green-500')
+            if _ai_turn_in_progress:
+                new_btn.disable()
 
 
 @ui.refreshable
-def mode_buttons():
-    """Game mode selection buttons."""
-    pvp = ui.button('Player vs Player', on_click=lambda: set_mode(GameMode.PVP)).classes('bg-green-500')
-    white = ui.button('Play as White vs AI', on_click=lambda: set_mode(GameMode.PVAI, 0)).classes('bg-blue-500')
-    black = ui.button('Play as Black vs AI', on_click=lambda: set_mode(GameMode.PVAI, 1)).classes('bg-gray-700')
-    aivai = ui.button('AI vs AI', on_click=lambda: set_mode(GameMode.AIVAI)).classes('bg-purple-500')
-    if game.game_active:
-        pvp.disable()
-        white.disable()
-        black.disable()
-        aivai.disable()
+def history_panel():
+    """State history sidebar with paste input and clickable entries."""
+    with ui.row().classes('w-full items-center justify-between mb-1'):
+        ui.label('Game States').classes('text-sm font-semibold text-gray-700')
+        ui.button('Clear', on_click=lambda: (game.clear_history(), refresh_all())).props('flat dense size=sm').classes('text-gray-500')
 
+    # Paste input + Load button
+    with ui.row().classes('w-full gap-1 mb-1'):
+        paste_input = ui.input(placeholder='Paste state string...').classes('flex-grow').props('dense')
 
-@ui.refreshable
-def quit_button():
-    """Quit game button."""
-    qb = ui.button('Quit', on_click=quit_game).classes('bg-red-500')
-    if not game.game_active:
-        qb.disable()
+        def do_load():
+            val = paste_input.value
+            if val and val.strip():
+                try:
+                    game.load_state_string(val.strip())
+                    paste_input.value = ''
+                    refresh_all()
+                except ValueError as e:
+                    ui.notify(str(e), type='negative')
+
+        load_btn = ui.button('Load', on_click=do_load).classes('bg-blue-500').props('dense')
+        if _ai_turn_in_progress:
+            load_btn.disable()
+
+    # Scrollable history list (newest first)
+    with ui.scroll_area().classes('w-full flex-grow'):
+        for i in range(len(game.history) - 1, -1, -1):
+            entry = game.history[i]
+            with ui.row().classes('w-full items-center gap-0 py-0'):
+                idx = i
+
+                def make_load_handler(idx=idx):
+                    def handler():
+                        if not _ai_turn_in_progress:
+                            game.load_history_entry(idx)
+                            refresh_all()
+                    return handler
+
+                ui.button(
+                    entry,
+                    on_click=make_load_handler(),
+                ).props('flat dense no-caps').classes('text-xs font-mono text-left flex-grow')
+
+                entry_str = entry
+
+                def make_copy_handler(s=entry_str):
+                    async def handler():
+                        escaped = s.replace('\\', '\\\\').replace("'", "\\'")
+                        await ui.run_javascript(f"navigator.clipboard.writeText('{escaped}')")
+                        ui.notify('Copied!', type='positive', position='bottom', timeout=1000)
+                    return handler
+
+                ui.button(
+                    icon='content_copy',
+                    on_click=make_copy_handler(),
+                ).props('flat dense round size=sm').classes('text-gray-500')
 
 
 @ui.refreshable
@@ -496,7 +665,6 @@ def ai_stats_panel():
         proven_wins = stats.get('proven_wins', 0)
         proven_losses = stats.get('proven_losses', 0)
 
-        # Format file size
         if file_size > 1024 * 1024 * 1024:
             size_str = f"{file_size / (1024**3):.1f} GB"
         elif file_size > 1024 * 1024:
@@ -506,7 +674,6 @@ def ai_stats_panel():
         else:
             size_str = f"{file_size} B"
 
-        # Format win rate
         if white_win_rate is not None:
             win_rate_str = f"{white_win_rate:.1%}"
             win_rate_sample = f"n={win_rate_sample_size}"
@@ -523,12 +690,12 @@ def ai_stats_panel():
         winrate_val.set_text(win_rate_str)
         winrate_sample.set_text(win_rate_sample)
 
-    with ui.card().classes('mt-4 px-4 py-3'):
-        with ui.row().classes('items-center justify-between w-full mb-2'):
+    with ui.card().classes('px-3 py-2 w-full'):
+        with ui.row().classes('items-center justify-between w-full mb-1'):
             ui.label('AI Stats').classes('text-sm font-semibold text-gray-700')
             ui.button(icon='refresh', on_click=update_stats).props('flat dense round size=sm').classes('text-gray-500')
 
-        with ui.grid(columns=4).classes('gap-x-6 gap-y-1 text-sm'):
+        with ui.grid(columns=4).classes('gap-x-4 gap-y-0 text-xs'):
             ui.label('States').classes('text-gray-500')
             ui.label('Games').classes('text-gray-500')
             ui.label('Size').classes('text-gray-500')
@@ -547,9 +714,8 @@ def ai_stats_panel():
             wins_val = ui.label('...').classes('font-medium text-green-600')
             losses_val = ui.label('...').classes('font-medium text-red-600')
             winrate_val = ui.label('...').classes('font-medium')
-            ui.label('')  # empty cell
+            ui.label('')
 
-    # Initial load and auto-refresh every 5 seconds
     ui.timer(0.5, update_stats, once=True)
     ui.timer(5.0, update_stats)
 
@@ -558,43 +724,31 @@ def refresh_all():
     """Refresh all UI components."""
     game_board.refresh()
     game_status.refresh()
-    game_controls_top.refresh()
-    game_controls_left.refresh()
-    game_controls_right.refresh()
     game_controls_bottom.refresh()
-    mode_buttons.refresh()
-    quit_button.refresh()
-
-
-def make_move(action: str):
-    """Make a move and refresh UI."""
-    game.make_move(action)
-    refresh_all()
+    history_panel.refresh()
 
 
 async def animate_ai_turn():
     """Animate a single AI turn, showing each move."""
     import asyncio
-    global _ai_turn_in_progress
+    global _ai_turn_in_progress, _animate_next
 
     if _ai_turn_in_progress:
         return False
 
     _ai_turn_in_progress = True
+    refresh_all()
 
     try:
-        # Get AI move from server
         query_state = game.get_state_for_ai()
         turn = await get_ai_move(query_state)
 
         if turn is None:
-            # AI has no moves or server error - AI loses
             game.game_over = True
             game.winner = 1 - game.current_player
             refresh_all()
             return False
 
-        # Apply each move with a delay
         for move in turn:
             if game.game_over:
                 break
@@ -604,10 +758,10 @@ async def animate_ai_turn():
                 break
 
             game.state = new_state
+            _animate_next = True
             refresh_all()
             await asyncio.sleep(MOVE_DELAY)
 
-            # Check for win
             winner = game.state.get_winner()
             if winner is not None:
                 game.game_over = True
@@ -615,10 +769,10 @@ async def animate_ai_turn():
                     game.winner = winner
                 else:
                     game.winner = 1 - winner
+                game._add_to_history()
                 refresh_all()
                 return False
 
-        # Finish the turn (switch player)
         if not game.game_over:
             game.finish_ai_turn()
             refresh_all()
@@ -626,66 +780,79 @@ async def animate_ai_turn():
         return not game.game_over
     finally:
         _ai_turn_in_progress = False
+        refresh_all()
 
 
-async def auto_play():
-    """Auto-play AI vs AI game."""
+async def do_ai_move():
+    """Execute a single AI turn."""
+    await animate_ai_turn()
+
+
+async def do_auto_play():
+    """Auto-play: AI plays both sides until game over or stopped."""
     import asyncio
-    while not game.game_over:
-        await animate_ai_turn()
-        await asyncio.sleep(TURN_DELAY)
+    global _auto_playing, _stop_auto_play
 
-
-def set_mode(mode: GameMode, human_player: int = 0):
-    """Change game mode and start new game."""
-    game.start_game(mode, human_player)
+    _auto_playing = True
+    _stop_auto_play = False
     refresh_all()
 
+    try:
+        while not game.game_over and not _stop_auto_play:
+            cont = await animate_ai_turn()
+            if not cont:
+                break
+            await asyncio.sleep(TURN_DELAY)
+    finally:
+        _auto_playing = False
+        _stop_auto_play = False
+        refresh_all()
 
-def quit_game():
-    """Quit current game and return to mode selection."""
-    game.quit_game()
-    refresh_all()
+
+def stop_auto_play_fn():
+    """Signal auto-play to stop."""
+    global _stop_auto_play
+    _stop_auto_play = True
 
 
 @ui.page('/')
 def main_page():
     ui.dark_mode(False)
+    ui.add_head_html('''<style>
+body, .q-page { overflow: hidden !important; }
+@keyframes piece-slide {
+    from { transform: translate(var(--slide-x), var(--slide-y)); }
+    to { transform: translate(0, 0); }
+}
+@keyframes piece-spin-cw {
+    from { transform: rotate(-90deg); }
+    to { transform: rotate(0deg); }
+}
+@keyframes piece-spin-ccw {
+    from { transform: rotate(90deg); }
+    to { transform: rotate(0deg); }
+}
+@keyframes piece-slide-off {
+    from { transform: translate(0, 0); opacity: 1; }
+    to { transform: translate(var(--off-x), var(--off-y)); opacity: 0; }
+}
+</style>''')
 
-    with ui.column().classes('w-full items-center p-4'):
-        ui.image(LOGO_URL).classes('w-80 mb-4')
+    # Full-height three-column layout: history | board + rules | logo + controls + ai
+    with ui.element('div').classes('w-full').style(
+        'display: grid; grid-template-columns: 1fr auto 1fr; gap: 16px;'
+        ' align-items: center; height: 100vh; padding: 32px 24px; box-sizing: border-box; overflow: hidden;'
+    ):
+        # Left column: game states
+        with ui.card().classes('p-3').style('height: calc(100vh - 64px); display: flex; flex-direction: column; overflow: hidden;'):
+            history_panel()
 
-        # Mode selection
-        with ui.card().classes('mb-4'):
-            ui.label('Game Mode').classes('text-lg font-bold mb-2')
-            with ui.row():
-                mode_buttons()
-                quit_button()
-
-        # Status
-        with ui.element('div').classes('mb-4'):
+        # Center column: status + board + rules
+        with ui.column().classes('items-center gap-0'):
             game_status()
-
-        # Game board with controls around it
-        with ui.column().classes('items-center gap-2'):
-            # Forward button on top
-            game_controls_top()
-
-            # Board with CCW on left and CW on right
-            with ui.row().classes('items-center gap-2'):
-                game_controls_left()
-                game_board()
-                game_controls_right()
-
-            # Undo/Submit below
-            game_controls_bottom()
-
-        # AI Stats panel
-        ai_stats_panel()
-
-        # Rules
-        with ui.expansion('Game Rules', icon='help').classes('mt-4 w-96'):
-            ui.markdown('''
+            game_board()
+            with ui.expansion('Game Rules', icon='help').classes('w-96 mt-2'):
+                ui.markdown('''
 **Duat** - Ancient Egyptian-themed abstract strategy game
 
 - 4x4 board, 3 pieces per player
@@ -694,14 +861,19 @@ def main_page():
 - A move is: slide forward OR rotate 90 degrees
 - You can push pieces not facing you
 - **Win:** Push an opponent's piece off the board
-            ''')
+                ''')
+
+        # Right column: logo, controls, ai stats
+        with ui.column().classes('w-full items-center gap-8'):
+            ui.image(LOGO_URL).classes('w-64')
+            game_controls_bottom()
+            ai_stats_panel()
 
 
 def graceful_shutdown(signum, frame):
     """Handle shutdown signals gracefully."""
     global _shutting_down
     if _shutting_down:
-        # Second signal - force quit
         print("\nForce quitting...")
         sys.exit(1)
 
@@ -711,7 +883,6 @@ def graceful_shutdown(signum, frame):
 
 
 if __name__ in {"__main__", "__mp_main__"}:
-    # Register signal handlers
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
 

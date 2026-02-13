@@ -4,7 +4,6 @@ GameState always represents the position from P0's perspective (P0 to move).
 After a turn, call swap_players() to get the opponent's view.
 """
 
-from collections import OrderedDict
 from enum import IntEnum
 from typing import Optional
 
@@ -44,22 +43,96 @@ Move = tuple[int, str]
 Turn = tuple[Move, ...]
 
 
-# Module-level LRU cache for canonical keys: raw_key -> (canonical_key, is_flipped)
-# Capped to prevent unbounded memory growth during long training runs.
+# --- Compact int encoding for state keys and turns ---
+# Action encoding: F=0, CW=1, CCW=2
+_ACTION_TO_INT = {"F": 0, "CW": 1, "CCW": 2}
+_INT_TO_ACTION = ("F", "CW", "CCW")
+
+
+def encode_key(pieces: tuple) -> int:
+    """Encode a pieces tuple into a single int (36 bits).
+
+    Each piece uses 6 bits: row(2) + col(2) + dir(2).
+    Player is implicit (pieces 0-2 = P0, 3-5 = P1 in canonical form).
+    """
+    val = 0
+    for i, (r, c, d, _p) in enumerate(pieces):
+        bits = (r << 4) | (c << 2) | int(d)
+        val |= bits << (i * 6)
+    return val
+
+
+def decode_key(val: int) -> tuple:
+    """Decode an int back to a pieces tuple."""
+    pieces = []
+    for i in range(6):
+        bits = (val >> (i * 6)) & 0x3F
+        r = (bits >> 4) & 0x3
+        c = (bits >> 2) & 0x3
+        d = Direction(bits & 0x3)
+        p = 0 if i < 3 else 1
+        pieces.append((r, c, d, p))
+    return tuple(pieces)
+
+
+def encode_turn(turn: Turn) -> int:
+    """Encode a turn (1 or 3 moves) into a single int.
+
+    Each move: piece_idx(3 bits) + action(2 bits) = 5 bits.
+    1-move turn: bits 0-4 (values 0-17, most cached as small ints).
+    3-move turn: bits 0-14 + bit 15 set as flag.
+    """
+    if len(turn) == 1:
+        idx, action = turn[0]
+        return (idx << 2) | _ACTION_TO_INT[action]
+    # 3-move turn
+    val = 0
+    for i, (idx, action) in enumerate(turn):
+        move_bits = (idx << 2) | _ACTION_TO_INT[action]
+        val |= move_bits << (i * 5)
+    return val | (1 << 15)
+
+
+def decode_turn(val: int) -> Turn:
+    """Decode an int back to a Turn tuple."""
+    if val & (1 << 15):
+        # 3-move turn
+        moves = []
+        for i in range(3):
+            move_bits = (val >> (i * 5)) & 0x1F
+            idx = move_bits >> 2
+            action = _INT_TO_ACTION[move_bits & 0x3]
+            moves.append((idx, action))
+        return tuple(moves)
+    # 1-move turn
+    idx = val >> 2
+    action = _INT_TO_ACTION[val & 0x3]
+    return ((idx, action),)
+
+
+def is_three_move_turn(val: int) -> bool:
+    """Check if an encoded turn int represents a 3-move turn."""
+    return bool(val & (1 << 15))
+
+
+# Module-level cache for canonical keys: raw_int_key -> encoded (canonical_key, is_flipped)
+# Encoded as (canonical_key << 1) | is_flipped.  Plain dict with periodic full clear.
 _CANONICAL_CACHE_MAX = 500_000
-_canonical_cache: OrderedDict[tuple, tuple[tuple, bool]] = OrderedDict()
+_canonical_cache: dict[int, int] = {}
 
 
-def _cache_put(key: tuple, value: tuple[tuple, bool]):
-    """Add entry to canonical cache with LRU eviction."""
-    _canonical_cache[key] = value
+def _cache_put(key: int, canonical_key: int, is_flipped: bool):
+    """Add entry to canonical cache with periodic full clear."""
+    global _canonical_cache
+    _canonical_cache[key] = (canonical_key << 1) | int(is_flipped)
     if len(_canonical_cache) > _CANONICAL_CACHE_MAX:
-        _canonical_cache.popitem(last=False)
+        _canonical_cache = {}
 
 
 def clear_canonical_cache():
     """Clear the canonical key cache (for testing)."""
-    _canonical_cache.clear()
+    global _canonical_cache
+    _canonical_cache = {}
 
 
 class GameState:
@@ -92,14 +165,14 @@ class GameState:
         )
         return cls(pieces)
 
-    def to_key(self) -> tuple:
-        """Convert to hashable key for storage."""
-        return self.pieces
+    def to_key(self) -> int:
+        """Convert to compact int key for storage."""
+        return encode_key(self.pieces)
 
     @classmethod
-    def from_key(cls, key: tuple) -> "GameState":
-        """Reconstruct from key."""
-        return cls(key)
+    def from_key(cls, key: int) -> "GameState":
+        """Reconstruct from int key."""
+        return cls(decode_key(key))
 
     def swap_players(self) -> "GameState":
         """
@@ -169,8 +242,10 @@ class GameState:
         key = self.to_key()
 
         # Check cache - if hit, we know canonical and is_flipped, just need mapping
-        if key in _canonical_cache:
-            canonical_key, is_flipped = _canonical_cache[key]
+        cached = _canonical_cache.get(key)
+        if cached is not None:
+            canonical_key = cached >> 1
+            is_flipped = bool(cached & 1)
             # Find the matching rotation to get the mapping
             base = self.flip_horizontal() if is_flipped else self
             for _ in range(4):
@@ -220,9 +295,9 @@ class GameState:
 
         # Cache all variants
         for k in normal_keys:
-            _cache_put(k, (best_key, best_flipped))
+            _cache_put(k, best_key, best_flipped)
         for k in flipped_keys:
-            _cache_put(k, (best_key, not best_flipped))
+            _cache_put(k, best_key, not best_flipped)
 
         return best_state, best_mapping, best_flipped
 
@@ -231,8 +306,9 @@ class GameState:
         key = self.to_key()
 
         # Check cache first
-        if key in _canonical_cache:
-            canonical_key, _ = _canonical_cache[key]
+        cached = _canonical_cache.get(key)
+        if cached is not None:
+            canonical_key = cached >> 1
             return GameState.from_key(canonical_key)
 
         # Compute canonical and cache all 8 variants
@@ -267,13 +343,11 @@ class GameState:
 
             state = state.rotate_cw()
 
-        # Cache all variants -> (canonical, is_flipped)
+        # Cache all variants -> encoded (canonical, is_flipped)
         for k in normal_keys:
-            _cache_put(k, (best_key, best_flipped))
+            _cache_put(k, best_key, best_flipped)
         for k in flipped_keys:
-            # If canonical used flip, these (already flipped) are not flipped relative to canonical
-            # If canonical didn't use flip, these (flipped) are flipped relative to canonical
-            _cache_put(k, (best_key, not best_flipped))
+            _cache_put(k, best_key, not best_flipped)
 
         return GameState.from_key(best_key)
 
@@ -430,7 +504,7 @@ class GameState:
         """
         # Map from resulting state key -> (turn, move_count)
         # We keep the turn with fewer moves for each resulting state
-        result_to_turn: dict[tuple, Turn] = {}
+        result_to_turn: dict = {}
 
         # 1-move turns (process first so they get priority)
         for m in self.get_legal_single_moves():
@@ -524,3 +598,79 @@ class GameState:
         lines = ["".join(row) for row in grid]
         lines.append(f"Player {current_player}'s turn")
         return "\n".join(lines)
+
+
+# --- Compact human-readable state string ---
+# Format: "S..S/..S./.n../n..n w"
+# 4 rows separated by '/', each row 4 chars.
+# White (P0 when current_player==0): N E S W (uppercase)
+# Black (P1 when current_player==0): n e s w (lowercase)
+# '.' = empty. Space then 'w' or 'b' = whose turn.
+
+_DIR_TO_WHITE = {Direction.NORTH: 'N', Direction.EAST: 'E',
+                 Direction.SOUTH: 'S', Direction.WEST: 'W'}
+_DIR_TO_BLACK = {Direction.NORTH: 'n', Direction.EAST: 'e',
+                 Direction.SOUTH: 's', Direction.WEST: 'w'}
+_CHAR_TO_DIR = {'N': Direction.NORTH, 'E': Direction.EAST,
+                'S': Direction.SOUTH, 'W': Direction.WEST,
+                'n': Direction.NORTH, 'e': Direction.EAST,
+                's': Direction.SOUTH, 'w': Direction.WEST}
+
+
+def state_to_string(state: GameState, current_player: int) -> str:
+    """Encode a game state as a compact human-readable string.
+
+    When current_player == 0, P0 in state = white (uppercase).
+    When current_player == 1, P0 in state = black (lowercase).
+    """
+    grid = [['.' for _ in range(4)] for _ in range(4)]
+    for row, col, direction, player in state.pieces:
+        # Map internal player to display color
+        if current_player == 0:
+            actual = player  # P0=white, P1=black
+        else:
+            actual = 1 - player  # P0=black, P1=white
+        if actual == 0:
+            grid[row][col] = _DIR_TO_WHITE[direction]
+        else:
+            grid[row][col] = _DIR_TO_BLACK[direction]
+    rows = '/'.join(''.join(r) for r in grid)
+    turn = 'w' if current_player == 0 else 'b'
+    return f'{rows} {turn}'
+
+
+def string_to_state(s: str) -> tuple[GameState, int]:
+    """Decode a state string back to (GameState, current_player).
+
+    Returns the state with current_player as P0.
+    """
+    s = s.strip()
+    parts = s.rsplit(' ', 1)
+    if len(parts) != 2 or parts[1] not in ('w', 'b'):
+        raise ValueError(f"Invalid state string: {s!r}")
+    board_str, turn_char = parts
+    current_player = 0 if turn_char == 'w' else 1
+
+    rows = board_str.split('/')
+    if len(rows) != 4:
+        raise ValueError(f"Expected 4 rows, got {len(rows)}")
+
+    pieces = []
+    for r, row in enumerate(rows):
+        if len(row) != 4:
+            raise ValueError(f"Row {r} has {len(row)} chars, expected 4")
+        for c, ch in enumerate(row):
+            if ch == '.':
+                continue
+            if ch not in _CHAR_TO_DIR:
+                raise ValueError(f"Unknown piece char: {ch!r}")
+            direction = _CHAR_TO_DIR[ch]
+            is_white = ch.isupper()
+            # Map display color to internal player
+            if current_player == 0:
+                player = 0 if is_white else 1  # white=P0, black=P1
+            else:
+                player = 1 if is_white else 0  # white=P1, black=P0
+            pieces.append((r, c, direction, player))
+
+    return GameState(tuple(pieces)), current_player
