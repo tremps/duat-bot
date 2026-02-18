@@ -85,6 +85,7 @@ def save_ai_pickle(ai, filepath: Union[str, Path]) -> None:
             "beads": info.beads,  # set[int]
             "distance_to_win": info.distance_to_win,
             "distance_to_loss": info.distance_to_loss,
+            "explored_depth": info.explored_depth,
         }
 
     def write_fn(f):
@@ -134,6 +135,7 @@ def load_ai_pickle(filepath: Union[str, Path]):
             beads=beads,
             distance_to_win=info_data["distance_to_win"],
             distance_to_loss=info_data["distance_to_loss"],
+            explored_depth=info_data.get("explored_depth", 0),
         )
 
     if needs_migration:
@@ -152,6 +154,7 @@ def save_ai_json(ai, filepath: Union[str, Path]) -> None:
             "beads": serialized_beads,
             "distance_to_win": info.distance_to_win,
             "distance_to_loss": info.distance_to_loss,
+            "explored_depth": info.explored_depth,
         }
 
     data = {
@@ -189,6 +192,7 @@ def load_ai_json(filepath: Union[str, Path]):
             beads=beads,
             distance_to_win=info_data["distance_to_win"],
             distance_to_loss=info_data["distance_to_loss"],
+            explored_depth=info_data.get("explored_depth", 0),
         )
 
     return ai

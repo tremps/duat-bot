@@ -7,18 +7,22 @@ from duat import (
     encode_turn, decode_turn, is_three_move_turn,
 )
 
+EXPLORE_DEPTH = 2
+
 
 class StateInfo:
     """Information about a game state. Uses __slots__ for compact memory."""
 
-    __slots__ = ("beads", "distance_to_win", "distance_to_loss")
+    __slots__ = ("beads", "distance_to_win", "distance_to_loss", "explored_depth")
 
     def __init__(self, beads: Optional[set[int]] = None,
                  distance_to_win: Optional[int] = None,
-                 distance_to_loss: Optional[int] = None):
+                 distance_to_loss: Optional[int] = None,
+                 explored_depth: int = 0):
         self.beads: set[int] = beads if beads is not None else set()
         self.distance_to_win = distance_to_win
         self.distance_to_loss = distance_to_loss
+        self.explored_depth = explored_depth
 
     def is_proven_loss(self) -> bool:
         """True if this state is a proven loss (no beads left)."""
@@ -90,6 +94,107 @@ class DuatAI:
     def _invert_mapping(self, mapping: dict[int, int]) -> dict[int, int]:
         """Invert a mapping: {a: b} -> {b: a}."""
         return {v: k for k, v in mapping.items()}
+
+    def explore_state(self, canonical: GameState, key: int,
+                      depth: Optional[int] = None,
+                      visiting: Optional[set[int]] = None) -> None:
+        """
+        Explore a state to the given depth, pruning losing beads and
+        detecting wins/losses via minimax.
+
+        Args:
+            canonical: The canonical GameState.
+            key: The canonical state key (int).
+            depth: How many plies to look ahead. Defaults to EXPLORE_DEPTH.
+            visiting: Set of keys currently on the call stack (cycle detection).
+        """
+        if depth is None:
+            depth = EXPLORE_DEPTH
+        if visiting is None:
+            visiting = set()
+
+        info = self.get_or_create_state(canonical, key)
+
+        # Already resolved or explored to sufficient depth — nothing to do
+        if info.distance_to_win is not None or len(info.beads) == 0 or info.explored_depth >= depth:
+            return
+
+        # Cycle detection
+        if key in visiting:
+            return
+
+        visiting.add(key)
+
+        # Depth 1: check immediate outcomes
+        to_remove = []
+        for turn_int in list(info.beads):
+            turn = decode_turn(turn_int)
+            result = canonical.apply_turn(turn)
+            if result is None:
+                to_remove.append(turn_int)
+                continue
+            winner = result.get_winner()
+            if winner == 0:
+                # We win immediately
+                info.beads = {turn_int}
+                info.distance_to_win = 1
+                visiting.discard(key)
+                return
+            elif winner == 1:
+                # We just lost — bad bead
+                to_remove.append(turn_int)
+
+        for t in to_remove:
+            info.beads.discard(t)
+
+        if len(info.beads) == 0:
+            self._mark_proven_loss(key)
+            visiting.discard(key)
+            return
+
+        if depth <= 1:
+            info.explored_depth = max(info.explored_depth, depth)
+            visiting.discard(key)
+            return
+
+        # Depth 2+: recurse into opponent states
+        to_remove = []
+        for turn_int in list(info.beads):
+            turn = decode_turn(turn_int)
+            result = canonical.apply_turn(turn)
+            if result is None:
+                to_remove.append(turn_int)
+                continue
+
+            # Swap to opponent's perspective and canonicalize
+            opp_state = result.swap_players()
+            opp_canonical, _, _ = opp_state.canonical_with_mapping()
+            opp_key = opp_canonical.to_key()
+
+            self.explore_state(opp_canonical, opp_key, depth - 1, visiting)
+
+            opp_info = self.states[opp_key]
+            if opp_info.distance_to_win is not None:
+                # Opponent can force a win — this bead is bad for us
+                to_remove.append(turn_int)
+            elif opp_info.distance_to_loss is not None:
+                # Opponent is proven to lose — we win!
+                info.beads = {turn_int}
+                info.distance_to_win = opp_info.distance_to_loss + 1
+                visiting.discard(key)
+                return
+
+        for t in to_remove:
+            info.beads.discard(t)
+
+        if len(info.beads) == 0:
+            self._mark_proven_loss(key)
+        else:
+            self._check_winning_state(key)
+
+        info.explored_depth = max(info.explored_depth, depth)
+
+        visiting.discard(key)
 
     def get_best_move(self, state: GameState) -> Optional[Turn]:
         """
@@ -187,55 +292,19 @@ class DuatAI:
         """
         Choose a turn for the current state (for training).
 
-        1. If there's a winning move, take it (prefer 1-move over 3-move).
-        2. Otherwise, random selection from available beads.
-        3. Returns None if this is a losing state (no beads).
+        Explores the state to EXPLORE_DEPTH, then picks randomly from
+        surviving beads. Returns None if this is a losing state (no beads).
 
         Returns (original_space_turn, canonical_int_turn) or None.
         """
-        info = self.get_or_create_state(canonical, key)
-        available = info.available_turns()  # list[int]
+        self.explore_state(canonical, key)
+        info = self.states[key]
+        available = info.available_turns()
 
         if not available:
             return None
 
         canon_to_orig = self._invert_mapping(orig_to_canon)
-
-        # Check for 1-move wins first
-        for turn_int in available:
-            if not is_three_move_turn(turn_int):
-                turn = decode_turn(turn_int)
-                result = canonical.apply_turn(turn)
-                if result and result.get_winner() == 0:
-                    info.beads = {turn_int}
-                    info.distance_to_win = 1
-                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
-
-        # Check for 3-move wins
-        for turn_int in available:
-            if is_three_move_turn(turn_int):
-                turn = decode_turn(turn_int)
-                result = canonical.apply_turn(turn)
-                if result and result.get_winner() == 0:
-                    info.beads = {turn_int}
-                    info.distance_to_win = 1
-                    return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
-
-        # Check for forced win in 2 turns (move to state with distance_to_loss == 1)
-        for turn_int in available:
-            turn = decode_turn(turn_int)
-            result = canonical.apply_turn(turn)
-            if result is None:
-                continue
-            result_swapped = result.swap_players()
-            result_key = result_swapped.canonical().to_key()
-            result_info = self.states.get(result_key)
-            if result_info and result_info.distance_to_loss == 1:
-                info.beads = {turn_int}
-                info.distance_to_win = 2
-                return (self._transform_turn(turn, canon_to_orig, is_flipped), turn_int)
-
-        # No winning move, pick random from available beads
         canonical_turn_int = random.choice(available)
         canonical_turn = decode_turn(canonical_turn_int)
         return (self._transform_turn(canonical_turn, canon_to_orig, is_flipped), canonical_turn_int)

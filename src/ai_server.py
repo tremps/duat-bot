@@ -31,11 +31,9 @@ DATA_DIR = PROJECT_ROOT / "data"
 AI_FILE = DATA_DIR / "ai_state.pkl"
 
 # Config
-TRAIN_BATCH_SIZE = 10
 AUTO_SAVE_INTERVAL = 1000
-BEST_MOVE_TRAIN_DURATION = 5.0
 WIN_RATE_WINDOW = 1000
-PROVEN_REFRESH_INTERVAL = 100  # Refresh proven counts every N batches
+PROVEN_REFRESH_INTERVAL = 100  # Refresh proven counts every N games
 
 # Global state
 ai: Optional[DuatAI] = None
@@ -76,17 +74,16 @@ def _maybe_save():
         _save_ai()
 
 
-def _train_batch():
-    """Train a batch of games from the starting position."""
+def _train_one():
+    """Train a single game from the starting position."""
     global _games_per_sec
     start_state = GameState.initial()
     start_time = time.monotonic()
-    for _ in range(TRAIN_BATCH_SIZE):
-        winner = ai.train_game(start_state)
-        _recent_results.append(winner)
+    winner = ai.train_game(start_state)
+    _recent_results.append(winner)
     elapsed = time.monotonic() - start_time
     if elapsed > 0:
-        _games_per_sec = TRAIN_BATCH_SIZE / elapsed
+        _games_per_sec = 1.0 / elapsed
     _maybe_save()
 
 
@@ -105,13 +102,10 @@ def _refresh_proven_counts():
 
 
 def _do_best_move(state: GameState) -> Optional[list]:
-    """Train from state for BEST_MOVE_TRAIN_DURATION, then return best move."""
-    start_time = time.monotonic()
-    while time.monotonic() - start_time < BEST_MOVE_TRAIN_DURATION:
-        if _stop_event.is_set():
-            break
-        ai.train_from_state(state, TRAIN_BATCH_SIZE)
-    _maybe_save()
+    """Explore state to EXPLORE_DEPTH and return the best move."""
+    canonical, orig_to_canon, is_flipped = state.canonical_with_mapping()
+    key = canonical.to_key()
+    ai.explore_state(canonical, key)
     turn = ai.get_best_move(state)
     return _serialize_turn(turn)
 
@@ -125,8 +119,8 @@ def _worker_loop():
         try:
             cmd, future = _work_queue.get(timeout=0.005)
         except queue.Empty:
-            # No commands — train a batch
-            _train_batch()
+            # No commands — train one game
+            _train_one()
             batches_since_refresh += 1
             if batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
                 _refresh_proven_counts()
