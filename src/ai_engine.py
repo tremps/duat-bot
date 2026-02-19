@@ -7,7 +7,29 @@ from duat import (
     encode_turn, decode_turn, is_three_move_turn,
 )
 
-EXPLORE_DEPTH = 2
+EXPLORE_DEPTH = 3
+
+
+class ImmediateWin:
+    """Compact sentinel for states with an immediate winning move.
+
+    Shared singleton — stores no per-instance data. The winning move
+    can be regenerated via GameState.find_winning_turn().
+    """
+
+    __slots__ = ()
+    distance_to_win = 1
+    distance_to_loss = None
+    explored_depth = 0
+
+    def is_proven_loss(self) -> bool:
+        return False
+
+    def available_turns(self) -> list[int]:
+        return []
+
+
+_IMMEDIATE_WIN = ImmediateWin()
 
 
 class StateInfo:
@@ -53,18 +75,15 @@ class DuatAI:
         self.states: dict[int, StateInfo] = {}
         self.games_trained = 0
 
-    def get_or_create_state(self, canonical: GameState, key: int) -> StateInfo:
-        """Get or create the StateInfo for a canonical state."""
+    def get_or_create_state(self, canonical: GameState, key: int):
+        """Get or create the state entry for a canonical state."""
         if key not in self.states:
             # Check for immediate win first - this is fast and avoids
             # computing all legal turns when we can just win
             winning_turn = canonical.find_winning_turn()
             if winning_turn:
-                # Immediate win - store just this one turn (encoded)
-                self.states[key] = StateInfo(
-                    beads={encode_turn(winning_turn)},
-                    distance_to_win=1
-                )
+                # Immediate win - use shared singleton (no per-state data)
+                self.states[key] = _IMMEDIATE_WIN
             else:
                 # No immediate win - compute all legal turns, encode them
                 turns = canonical.get_legal_turns()
@@ -136,8 +155,7 @@ class DuatAI:
             winner = result.get_winner()
             if winner == 0:
                 # We win immediately
-                info.beads = {turn_int}
-                info.distance_to_win = 1
+                self.states[key] = _IMMEDIATE_WIN
                 visiting.discard(key)
                 return
             elif winner == 1:
@@ -209,9 +227,16 @@ class DuatAI:
         canonical, orig_to_canon, is_flipped = state.canonical_with_mapping()
         key = canonical.to_key()
         info = self.get_or_create_state(canonical, key)
-        available = info.available_turns()  # list[int]
 
         canon_to_orig = self._invert_mapping(orig_to_canon)
+
+        # Immediate win — regenerate the winning move on the fly
+        if info is _IMMEDIATE_WIN:
+            winning_turn = canonical.find_winning_turn()
+            if winning_turn:
+                return self._transform_turn(winning_turn, canon_to_orig, is_flipped)
+
+        available = info.available_turns()  # list[int]
 
         if available:
             # Check for 1-move wins first
@@ -220,8 +245,7 @@ class DuatAI:
                     turn = decode_turn(turn_int)
                     result = canonical.apply_turn(turn)
                     if result and result.get_winner() == 0:
-                        info.beads = {turn_int}
-                        info.distance_to_win = 1
+                        self.states[key] = _IMMEDIATE_WIN
                         return self._transform_turn(turn, canon_to_orig, is_flipped)
 
             # Check for 3-move wins
@@ -230,8 +254,7 @@ class DuatAI:
                     turn = decode_turn(turn_int)
                     result = canonical.apply_turn(turn)
                     if result and result.get_winner() == 0:
-                        info.beads = {turn_int}
-                        info.distance_to_win = 1
+                        self.states[key] = _IMMEDIATE_WIN
                         return self._transform_turn(turn, canon_to_orig, is_flipped)
 
             # Have beads - pick move with lowest opponent distance_to_loss (quickest win for us)
@@ -299,6 +322,15 @@ class DuatAI:
         """
         self.explore_state(canonical, key)
         info = self.states[key]
+
+        # Immediate win — regenerate the winning move on the fly
+        if info is _IMMEDIATE_WIN:
+            winning_turn = canonical.find_winning_turn()
+            if winning_turn:
+                canon_to_orig = self._invert_mapping(orig_to_canon)
+                return (self._transform_turn(winning_turn, canon_to_orig, is_flipped), encode_turn(winning_turn))
+            return None
+
         available = info.available_turns()
 
         if not available:
@@ -321,7 +353,7 @@ class DuatAI:
         or None otherwise.
         """
         info = self.states.get(key)
-        if info is None:
+        if info is None or info is _IMMEDIATE_WIN:
             return None
 
         if canonical_turn_int in info.beads:
@@ -558,6 +590,13 @@ class DuatAI:
         canonical = state.canonical()
         key = canonical.to_key()
         info = self.get_or_create_state(canonical, key)
+        if info is _IMMEDIATE_WIN:
+            return {
+                "available_turns": 1,
+                "is_proven_loss": False,
+                "distance_to_win": 1,
+                "distance_to_loss": None,
+            }
         return {
             "available_turns": len(info.beads),
             "is_proven_loss": info.is_proven_loss(),

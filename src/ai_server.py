@@ -43,6 +43,7 @@ _worker_thread: Optional[threading.Thread] = None
 _last_saved_at = 0
 _recent_results: deque = deque(maxlen=WIN_RATE_WINDOW)
 _games_per_sec: float = 0.0
+_training_enabled: bool = True
 
 # Cached proven state counts (updated by worker thread)
 _proven_wins: int = 0
@@ -110,6 +111,15 @@ def _do_best_move(state: GameState) -> Optional[list]:
     return _serialize_turn(turn)
 
 
+def _do_analyze(state: GameState) -> dict:
+    """Explore state and return analysis info."""
+    canonical, _, _ = state.canonical_with_mapping()
+    key = canonical.to_key()
+    ai.explore_state(canonical, key)
+    info = ai.get_state_info(state)
+    return info
+
+
 def _worker_loop():
     """Single worker thread: processes commands and trains when idle."""
     batches_since_refresh = 0
@@ -119,12 +129,14 @@ def _worker_loop():
         try:
             cmd, future = _work_queue.get(timeout=0.005)
         except queue.Empty:
-            # No commands — train one game
-            _train_one()
-            batches_since_refresh += 1
-            if batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
-                _refresh_proven_counts()
-                batches_since_refresh = 0
+            if _training_enabled:
+                _train_one()
+                batches_since_refresh += 1
+                if batches_since_refresh >= PROVEN_REFRESH_INTERVAL:
+                    _refresh_proven_counts()
+                    batches_since_refresh = 0
+            else:
+                time.sleep(0.01)
             continue
 
         # Process command
@@ -135,6 +147,10 @@ def _worker_loop():
                 future.set_result(result)
                 _refresh_proven_counts()
                 batches_since_refresh = 0
+            elif cmd == "analyze":
+                state = future._state_arg
+                result = _do_analyze(state)
+                future.set_result(result)
             elif cmd == "save":
                 _save_ai()
                 future.set_result(None)
@@ -181,6 +197,12 @@ class StatsResponse(BaseModel):
     proven_losses: int
 
 
+class AnalyzeResponse(BaseModel):
+    distance_to_win: Optional[int]
+    distance_to_loss: Optional[int]
+    available_turns: int
+
+
 class WinRateResponse(BaseModel):
     white_win_rate: Optional[float]
     sample_size: int
@@ -200,7 +222,10 @@ async def lifespan(app: FastAPI):
 
     _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
     _worker_thread.start()
-    print("Worker thread started — training when idle")
+    if _training_enabled:
+        print("Worker thread started — training when idle")
+    else:
+        print("Worker thread started — serve only (no training)")
 
     yield
 
@@ -234,6 +259,19 @@ async def best_move(request: StateKeyRequest):
     future = _submit_command("best_move", state=state)
     result = await asyncio.wrap_future(future)
     return BestMoveResponse(turn=result)
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(request: StateKeyRequest):
+    """Analyze a state: explore it and return win/loss info."""
+    state = _parse_state_key(request.state_key)
+    future = _submit_command("analyze", state=state)
+    result = await asyncio.wrap_future(future)
+    return AnalyzeResponse(
+        distance_to_win=result["distance_to_win"],
+        distance_to_loss=result["distance_to_loss"],
+        available_turns=result["available_turns"],
+    )
 
 
 @app.get("/stats", response_model=StatsResponse)
@@ -304,9 +342,18 @@ async def stop_endpoint():
 
 
 if __name__ == "__main__":
+    import argparse
     import uvicorn
 
-    print("Starting Duat AI Server...")
+    parser = argparse.ArgumentParser(description="Duat AI Server")
+    parser.add_argument("-n", "--no-train", action="store_true",
+                        help="Serve only — do not train in the background")
+    args = parser.parse_args()
+
+    _training_enabled = not args.no_train
+
+    mode = "serve-only (no training)" if not _training_enabled else "train + serve"
+    print(f"Starting Duat AI Server ({mode})...")
     print("Press Ctrl+C to stop")
 
     uvicorn.run(

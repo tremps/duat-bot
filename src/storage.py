@@ -79,28 +79,35 @@ def _migrate_old_turn(turn: tuple) -> int:
 
 def save_ai_pickle(ai, filepath: Union[str, Path]) -> None:
     """Save AI state using pickle (fast, compact)."""
+    from ai_engine import _IMMEDIATE_WIN
+
     states_data = {}
+    immediate_wins = []
     for key, info in ai.states.items():
-        states_data[key] = {
-            "beads": info.beads,  # set[int]
-            "distance_to_win": info.distance_to_win,
-            "distance_to_loss": info.distance_to_loss,
-            "explored_depth": info.explored_depth,
-        }
+        if info is _IMMEDIATE_WIN:
+            immediate_wins.append(key)
+        else:
+            states_data[key] = {
+                "beads": info.beads,  # set[int]
+                "distance_to_win": info.distance_to_win,
+                "distance_to_loss": info.distance_to_loss,
+                "explored_depth": info.explored_depth,
+            }
 
     def write_fn(f):
         pickle.dump({
             "states": states_data,
+            "immediate_wins": immediate_wins,
             "games_trained": ai.games_trained,
-            "version": 2,  # int-encoded format
+            "version": 3,
         }, f)
 
     _atomic_write(Path(filepath), write_fn)
 
 
 def load_ai_pickle(filepath: Union[str, Path]):
-    """Load AI state from pickle file, auto-migrating old tuple format."""
-    from ai_engine import DuatAI, StateInfo
+    """Load AI state from pickle file, auto-migrating old formats."""
+    from ai_engine import DuatAI, StateInfo, _IMMEDIATE_WIN
 
     with open(filepath, "rb") as f:
         data = pickle.load(f)
@@ -117,6 +124,7 @@ def load_ai_pickle(filepath: Union[str, Path]):
 
     for key, info_data in data["states"].items():
         beads = info_data["beads"]
+        dtw = info_data["distance_to_win"]
 
         if needs_migration and _is_old_tuple_key(key):
             # Migrate old tuple key to int
@@ -131,12 +139,20 @@ def load_ai_pickle(filepath: Union[str, Path]):
             if not isinstance(beads, set):
                 beads = set(beads)
 
-        ai.states[key] = StateInfo(
-            beads=beads,
-            distance_to_win=info_data["distance_to_win"],
-            distance_to_loss=info_data["distance_to_loss"],
-            explored_depth=info_data.get("explored_depth", 0),
-        )
+        # Convert dtw=1 single-bead states to compact ImmediateWin
+        if dtw == 1 and len(beads) <= 1:
+            ai.states[key] = _IMMEDIATE_WIN
+        else:
+            ai.states[key] = StateInfo(
+                beads=beads,
+                distance_to_win=dtw,
+                distance_to_loss=info_data["distance_to_loss"],
+                explored_depth=info_data.get("explored_depth", 0),
+            )
+
+    # Load immediate wins (version 3+)
+    for key in data.get("immediate_wins", []):
+        ai.states[key] = _IMMEDIATE_WIN
 
     if needs_migration:
         print(f"Migration complete: {migrated:,} states converted")
@@ -146,21 +162,28 @@ def load_ai_pickle(filepath: Union[str, Path]):
 
 def save_ai_json(ai, filepath: Union[str, Path]) -> None:
     """Save AI state using JSON (human-readable, portable)."""
+    from ai_engine import _IMMEDIATE_WIN
+
     serialized_states = {}
+    immediate_win_keys = []
     for key, info in ai.states.items():
-        key_str = _serialize_key(key)
-        serialized_beads = [_serialize_turn(turn_int) for turn_int in info.beads]
-        serialized_states[key_str] = {
-            "beads": serialized_beads,
-            "distance_to_win": info.distance_to_win,
-            "distance_to_loss": info.distance_to_loss,
-            "explored_depth": info.explored_depth,
-        }
+        if info is _IMMEDIATE_WIN:
+            immediate_win_keys.append(_serialize_key(key))
+        else:
+            key_str = _serialize_key(key)
+            serialized_beads = [_serialize_turn(turn_int) for turn_int in info.beads]
+            serialized_states[key_str] = {
+                "beads": serialized_beads,
+                "distance_to_win": info.distance_to_win,
+                "distance_to_loss": info.distance_to_loss,
+                "explored_depth": info.explored_depth,
+            }
 
     data = {
         "games_trained": ai.games_trained,
         "states": serialized_states,
-        "version": 2,
+        "immediate_wins": immediate_win_keys,
+        "version": 3,
     }
 
     def write_fn(f):
@@ -177,7 +200,7 @@ def save_ai_json(ai, filepath: Union[str, Path]) -> None:
 
 def load_ai_json(filepath: Union[str, Path]):
     """Load AI state from JSON file."""
-    from ai_engine import DuatAI, StateInfo
+    from ai_engine import DuatAI, StateInfo, _IMMEDIATE_WIN
 
     with open(filepath, "r") as f:
         data = json.load(f)
@@ -188,12 +211,21 @@ def load_ai_json(filepath: Union[str, Path]):
     for key_str, info_data in data["states"].items():
         key = _deserialize_key(key_str)
         beads = {_deserialize_turn(t) for t in info_data["beads"]}
-        ai.states[key] = StateInfo(
-            beads=beads,
-            distance_to_win=info_data["distance_to_win"],
-            distance_to_loss=info_data["distance_to_loss"],
-            explored_depth=info_data.get("explored_depth", 0),
-        )
+        dtw = info_data["distance_to_win"]
+        if dtw == 1 and len(beads) <= 1:
+            ai.states[key] = _IMMEDIATE_WIN
+        else:
+            ai.states[key] = StateInfo(
+                beads=beads,
+                distance_to_win=dtw,
+                distance_to_loss=info_data["distance_to_loss"],
+                explored_depth=info_data.get("explored_depth", 0),
+            )
+
+    # Load immediate wins (version 3+)
+    for key_str in data.get("immediate_wins", []):
+        key = _deserialize_key(key_str)
+        ai.states[key] = _IMMEDIATE_WIN
 
     return ai
 

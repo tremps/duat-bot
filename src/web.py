@@ -3,6 +3,7 @@
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +37,13 @@ _prev_grid: dict = {}   # {(display_row, col): (actual_player, game_direction)}
 _animate_next = False
 CELL_STEP = 124  # 120px cell + 4px (gap-1)
 
+# Analysis state
+_analysis_result: Optional[dict] = None
+_analysis_state_key: Optional[str] = None
+_analyzing = False
+_analysis_elapsed: Optional[float] = None
+_ai_move_elapsed: Optional[float] = None
+
 
 def _build_grid() -> dict:
     """Build map of current piece display positions."""
@@ -68,53 +76,55 @@ def _compute_animations(new_grid: dict) -> tuple:
     if not changed:
         return empty
 
-    # Find the slide direction: look for any position that lost a piece
-    # paired with any position that gained a same-player piece.
-    norm_dr = norm_dc = 0
+    # Detect forward move: find the cell that was occupied and is now empty
+    source = None
     for pos in changed:
-        old = _prev_grid.get(pos)
-        if old and (pos not in new_grid or new_grid[pos][0] != old[0]):
-            lost_player = old[0]
-            for pos2 in changed:
-                new2 = new_grid.get(pos2)
-                if new2 and new2[0] == lost_player:
-                    old2 = _prev_grid.get(pos2)
-                    if old2 is None or old2[0] != lost_player:
-                        dr = pos2[0] - pos[0]
-                        dc = pos2[1] - pos[1]
-                        mag = max(abs(dr), abs(dc))
-                        if mag > 0:
-                            norm_dr = dr // mag
-                            norm_dc = dc // mag
-                            break
-        if norm_dr or norm_dc:
+        if pos in _prev_grid and pos not in new_grid:
+            source = pos
             break
 
-    if norm_dr or norm_dc:
-        # Forward move — find the full extent of the push chain
-        source = min(changed, key=lambda p: p[0] * norm_dr + p[1] * norm_dc)
-        end = max(changed, key=lambda p: p[0] * norm_dr + p[1] * norm_dc)
-        chain_len = (end[0] - source[0]) * norm_dr + (end[1] - source[1]) * norm_dc
+    if source is not None:
+        # Use the piece's facing direction to determine slide direction
+        _, old_dir = _prev_grid[source]
+        _dir_display = {
+            Direction.NORTH: (1, 0),
+            Direction.SOUTH: (-1, 0),
+            Direction.EAST: (0, 1),
+            Direction.WEST: (0, -1),
+        }
+        norm_dr, norm_dc = _dir_display[old_dir]
+
+        # Walk from source along direction through prev_grid to find full chain
+        chain = [source]
+        r, c = source[0] + norm_dr, source[1] + norm_dc
+        while 0 <= r <= 3 and 0 <= c <= 3 and (r, c) in _prev_grid:
+            chain.append((r, c))
+            r += norm_dr
+            c += norm_dc
+
+        last = chain[-1]
+        off_r = last[0] + norm_dr
+        off_c = last[1] + norm_dc
+        pushed_off = not (0 <= off_r <= 3 and 0 <= off_c <= 3)
 
         dx = -norm_dc * CELL_STEP
         dy = -norm_dr * CELL_STEP
         slide = f'animation: piece-slide 0.3s ease-out; --slide-x: {dx}px; --slide-y: {dy}px'
 
-        # Walk the full chain, animating every piece
+        # Animate pieces that slid into new positions
         animations = {}
-        r, c = source[0] + norm_dr, source[1] + norm_dc
-        for _ in range(chain_len):
-            if (r, c) in new_grid:
-                animations[(r, c)] = slide
-            r += norm_dr
-            c += norm_dc
+        for i in range(1, len(chain)):
+            pos = chain[i]
+            if pos in new_grid:
+                animations[pos] = slide
+        # If last piece wasn't pushed off, it slid one step further
+        if not pushed_off and (off_r, off_c) in new_grid:
+            animations[(off_r, off_c)] = slide
 
-        # Check for elimination: if one step past the chain end is off-board,
-        # the piece that was at 'end' in prev_grid was pushed off
+        # Ghost for the piece pushed off the board
         ghosts = []
-        off_r, off_c = end[0] + norm_dr, end[1] + norm_dc
-        if not (0 <= off_r <= 3 and 0 <= off_c <= 3):
-            ghost_piece = _prev_grid.get(end)
+        if pushed_off:
+            ghost_piece = _prev_grid.get(last)
             if ghost_piece:
                 gdx = norm_dc * CELL_STEP
                 gdy = norm_dr * CELL_STEP
@@ -122,7 +132,7 @@ def _compute_animations(new_grid: dict) -> tuple:
                     f'animation: piece-slide-off 0.3s ease-out forwards;'
                     f' --off-x: {gdx}px; --off-y: {gdy}px'
                 )
-                ghosts.append((end[0], end[1], ghost_piece[0], ghost_piece[1], ghost_style))
+                ghosts.append((last[0], last[1], ghost_piece[0], ghost_piece[1], ghost_style))
 
         return animations, ghosts
 
@@ -187,7 +197,7 @@ def _deserialize_turn(turn_data: list) -> Optional[Turn]:
 async def get_ai_move(state: GameState) -> Optional[Turn]:
     """Query AI server for best move."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
             state_key = _serialize_state_key(state)
             resp = await client.post(
                 f"{AI_SERVER_URL}/best_move",
@@ -201,10 +211,26 @@ async def get_ai_move(state: GameState) -> Optional[Turn]:
         return None
 
 
+async def analyze_state(state: GameState) -> Optional[dict]:
+    """Query AI server to analyze a state."""
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            state_key = _serialize_state_key(state)
+            resp = await client.post(
+                f"{AI_SERVER_URL}/analyze",
+                json={"state_key": state_key}
+            )
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        print(f"Error analyzing state: {e}")
+        return None
+
+
 async def get_ai_stats() -> dict:
     """Get AI server statistics."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.get(f"{AI_SERVER_URL}/stats")
             resp.raise_for_status()
             return resp.json()
@@ -543,17 +569,54 @@ def game_board():
 
 @ui.refreshable
 def game_status():
-    """Show current game status."""
-    if game.game_over:
-        winner_name = "White" if game.winner == 0 else "Black"
-        ui.label(f'{winner_name} wins!').classes('text-lg font-bold text-green-600')
-    else:
-        player_name = game.get_current_player_name()
-        moves = len(game.current_turn_moves)
-        if moves > 0:
-            ui.label(f"{player_name}'s Turn ({moves} move{'s' if moves != 1 else ''})").classes('text-lg font-bold')
+    """Show current game status with analyze button."""
+    with ui.card().classes('px-3 py-2 mb-2'):
+        # Turn indicator
+        if game.game_over:
+            winner_name = "White" if game.winner == 0 else "Black"
+            ui.label(f'{winner_name} wins!').classes('text-lg font-bold text-green-600')
         else:
-            ui.label(f"{player_name}'s Turn").classes('text-lg font-bold')
+            player_name = game.get_current_player_name()
+            moves = len(game.current_turn_moves)
+            if moves > 0:
+                ui.label(f"{player_name}'s Turn ({moves} move{'s' if moves != 1 else ''})").classes('text-lg font-bold')
+            else:
+                ui.label(f"{player_name}'s Turn").classes('text-lg font-bold')
+
+        # Analyze
+        with ui.row().classes('items-center gap-2 mt-1'):
+            async def on_analyze():
+                global _analysis_result, _analysis_state_key, _analyzing, _analysis_elapsed
+                _analyzing = True
+                game_status.refresh()
+                state = game.get_state_for_ai()
+                _analysis_state_key = state_to_string(state, game.current_player)
+                start = time.monotonic()
+                result = await analyze_state(state)
+                _analysis_elapsed = time.monotonic() - start
+                _analysis_result = result
+                _analyzing = False
+                game_status.refresh()
+
+            analyze_btn = ui.button('Analyze', on_click=on_analyze).props('dense size=sm').classes('bg-teal-500')
+            if _analyzing or _ai_turn_in_progress:
+                analyze_btn.disable()
+
+            # Show result if available and still matches current state
+            current_key = state_to_string(game.state, game.current_player)
+            if _analysis_result is not None and _analysis_state_key == current_key:
+                dtw = _analysis_result.get("distance_to_win")
+                dtl = _analysis_result.get("distance_to_loss")
+                turns = _analysis_result.get("available_turns", 0)
+                time_str = f' ({_analysis_elapsed:.1f}s)' if _analysis_elapsed is not None else ''
+                if dtw is not None:
+                    ui.label(f'Win in {dtw}{time_str}').classes('text-sm font-bold text-green-600')
+                elif dtl is not None:
+                    ui.label(f'Loss in {dtl}{time_str}').classes('text-sm font-bold text-red-600')
+                else:
+                    ui.label(f'Unknown ({turns} beads){time_str}').classes('text-sm font-bold text-gray-500')
+            elif _analyzing:
+                ui.spinner(size='sm')
 
 
 @ui.refreshable
@@ -563,7 +626,10 @@ def game_controls_bottom():
     ai_disabled = game.is_mid_turn() or _ai_turn_in_progress or game.game_over
 
     with ui.card().classes('px-3 py-2 w-full'):
-        ui.label('Controls').classes('text-sm font-semibold text-gray-700 mb-1')
+        with ui.row().classes('items-center justify-between w-full mb-1'):
+            ui.label('Controls').classes('text-sm font-semibold text-gray-700')
+            if _ai_move_elapsed is not None:
+                ui.label(f'AI: {_ai_move_elapsed:.1f}s').classes('text-xs text-gray-500')
 
         with ui.row().classes('gap-1 flex-wrap'):
             undo_btn = ui.button('Undo', on_click=lambda: (game.undo_move(), refresh_all())).props('dense').classes('bg-yellow-500')
@@ -722,6 +788,13 @@ def ai_stats_panel():
 
 def refresh_all():
     """Refresh all UI components."""
+    global _analysis_result, _analysis_state_key, _analysis_elapsed
+    # Clear stale analysis when state changes
+    current_key = state_to_string(game.state, game.current_player)
+    if _analysis_state_key != current_key:
+        _analysis_result = None
+        _analysis_state_key = None
+        _analysis_elapsed = None
     game_board.refresh()
     game_status.refresh()
     game_controls_bottom.refresh()
@@ -731,7 +804,7 @@ def refresh_all():
 async def animate_ai_turn():
     """Animate a single AI turn, showing each move."""
     import asyncio
-    global _ai_turn_in_progress, _animate_next
+    global _ai_turn_in_progress, _animate_next, _ai_move_elapsed
 
     if _ai_turn_in_progress:
         return False
@@ -741,7 +814,9 @@ async def animate_ai_turn():
 
     try:
         query_state = game.get_state_for_ai()
+        start = time.monotonic()
         turn = await get_ai_move(query_state)
+        _ai_move_elapsed = time.monotonic() - start
 
         if turn is None:
             game.game_over = True
